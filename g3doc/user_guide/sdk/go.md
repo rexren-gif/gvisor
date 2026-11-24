@@ -86,6 +86,21 @@ func (s *Sandbox) Bundle() string
 
 Returns the path to the OCI bundle directory for this sandbox.
 
+#### PID
+
+```go
+func (s *Sandbox) PID(ctx context.Context) (int, error)
+```
+
+Returns the host PID of the sandbox process, which runs gVisor's kernel, as
+`runsc state` reports it. Joining the namespaces of this process or tracing it
+runs code outside the sandbox. Limits and cgroup moves applied to it do not
+cover the workload, whose threads run in other host processes. The PID is stale
+once the sandbox stops.
+
+*   **`ctx`**: Context for the `runsc state` call.
+*   **Returns**: The PID, or an error if `runsc state` fails.
+
 ### Option
 
 `Option` is a function type used to configure a sandbox.

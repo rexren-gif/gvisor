@@ -24,9 +24,11 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -34,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/sandboxexec/sandbox"
 )
@@ -94,6 +97,14 @@ type bwrapConfig struct {
 	AsPID1      bool
 	hasArgv0    bool
 	nextPerms   *uint32
+
+	// InfoFD is the --info-fd file descriptor, or nil.
+	InfoFD *int
+	// BlockFD is the --block-fd file descriptor, or nil.
+	BlockFD *int
+	// unusedFDs holds the descriptors of --info-fd and --block-fd flags that
+	// a later one of the same flag replaces.
+	unusedFDs []int
 }
 
 // String returns a string representation of the bwrapConfig.
@@ -456,8 +467,232 @@ func mkdir(path string, perms uint32, uid, gid int) error {
 	return unix.Chmod(path, perms|st.Mode&unix.S_ISGID)
 }
 
+// inherited reports whether fd is an open descriptor that runsc inherited.
+// runsc opens its own descriptors close-on-exec, and a descriptor that
+// survived execve is not close-on-exec. The Go runtime opens /dev/null as a
+// stdio descriptor that is closed at startup, so such a descriptor counts as
+// inherited.
+func inherited(fd int) error {
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	if err != nil {
+		return err
+	}
+	if flags&unix.FD_CLOEXEC != 0 {
+		return unix.EBADF
+	}
+	return nil
+}
+
+// runscFDFlags are the global runsc flags that give runsc a descriptor of its
+// own.
+var runscFDFlags = []string{"log-fd", "debug-log-fd", "panic-log-fd", "coverage-fd"}
+
+// runscFD returns the global runsc flag that gives runsc fd, or "".
+func runscFD(fd int) string {
+	for _, name := range runscFDFlags {
+		if f := flag.Lookup(name); f != nil && f.Value.String() == strconv.Itoa(fd) {
+			return name
+		}
+	}
+	return ""
+}
+
+// takeFD takes over the --info-fd or --block-fd descriptor fd, named after the
+// flag, and returns a close-on-exec duplicate. It closes fd, so that the runsc
+// processes that run the sandbox do not keep it open. A stdio descriptor stays
+// open, so that runsc can still report errors; nullStdio replaces it later.
+func takeFD(fd int, name string) (int, error) {
+	if err := inherited(fd); err != nil {
+		return -1, fmt.Errorf("bwrap: Invalid --%s %d: %v", name, fd, err)
+	}
+	if runscName := runscFD(fd); runscName != "" {
+		return -1, fmt.Errorf("bwrap: Invalid --%s %d: runsc uses it for --%s", name, fd, runscName)
+	}
+	dup, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 3)
+	if err != nil {
+		if fd > 2 {
+			unix.CloseOnExec(fd)
+		}
+		return -1, fmt.Errorf("bwrap: Can't use --%s %d: %v", name, fd, err)
+	}
+	if fd > 2 {
+		unix.Close(fd)
+	}
+	return dup, nil
+}
+
+// nullStdio replaces the stdio descriptor fd with /dev/null, which the command
+// then sees there. It does nothing if fd is not a stdio descriptor.
+func nullStdio(fd int) error {
+	if fd < 0 || fd > 2 {
+		return nil
+	}
+	null, err := unix.Open(os.DevNull, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(null)
+	if err := unix.Dup3(null, fd, 0); err != nil {
+		return fmt.Errorf("can't replace fd %d with %s: %v", fd, os.DevNull, err)
+	}
+	return nil
+}
+
+// infoPollInterval is how often writeInfo checks for a signal while it waits
+// for --info-fd to take data.
+const infoPollInterval = 100 * time.Millisecond
+
+// writeInfo writes the --info-fd JSON object, with the host PID of the
+// sandbox process as "child-pid", to fd, and closes fd. It waits until fd can
+// take the object, which is smaller than PIPE_BUF, so the write does not
+// block. If a signal comes in sigCh before the write, writeInfo writes
+// nothing and returns that signal.
+func writeInfo(ctx context.Context, sb *sandbox.Sandbox, fd int, sigCh <-chan os.Signal) (os.Signal, error) {
+	defer unix.Close(fd)
+	// poll never reports a read-only pipe as ready to write.
+	if mode, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0); err == nil && mode&unix.O_ACCMODE == unix.O_RDONLY {
+		return nil, fmt.Errorf("failed to write to --%s: %v", flagInfoFD, unix.EBADF)
+	}
+	pid, err := sb.PID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	data, err := json.MarshalIndent(map[string]int{"child-pid": pid}, "", "    ")
+	if err != nil {
+		return nil, err
+	}
+	data = append(data, '\n')
+	for {
+		if sig := pendingSignal(sigCh); sig != nil {
+			return sig, nil
+		}
+		n, err := unix.Poll([]unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}, int(infoPollInterval.Milliseconds()))
+		if err == unix.EINTR || (err == nil && n == 0) {
+			continue
+		}
+		// fd is ready, or the write reports the error.
+		break
+	}
+	for len(data) > 0 {
+		n, err := unix.Write(fd, data)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to write to --%s: %v", flagInfoFD, err)
+		}
+		data = data[n:]
+	}
+	return nil, nil
+}
+
+// waitBlock waits until fd has data to read, reaches end of file or fails to
+// read, then closes fd. It reads at most one byte. A read that would block,
+// on a non-blocking descriptor, counts as a failed read.
+func waitBlock(fd int) {
+	var b [1]byte
+	for {
+		if _, err := unix.Read(fd, b[:]); err != unix.EINTR {
+			break
+		}
+	}
+	unix.Close(fd)
+}
+
+// interruptible runs fn and returns nil when fn returns. If a signal is in
+// sigCh before or while fn runs, interruptible returns that signal instead,
+// and fn continues to run in the background.
+func interruptible(sigCh <-chan os.Signal, fn func()) os.Signal {
+	if sig := pendingSignal(sigCh); sig != nil {
+		return sig
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+		return nil
+	case sig := <-sigCh:
+		return sig
+	}
+}
+
+// pendingSignal returns the signal waiting in sigCh, if any.
+func pendingSignal(sigCh <-chan os.Signal) os.Signal {
+	select {
+	case sig := <-sigCh:
+		return sig
+	default:
+		return nil
+	}
+}
+
 // do runs the command in a gVisor sandbox and records its exit status.
 func do(ctx context.Context, c *bwrapConfig, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
+	infoFD, blockFD := -1, -1
+	// infoStdio and blockStdio are the descriptors of --info-fd and
+	// --block-fd if they are stdio descriptors that runsc uses, or -1.
+	infoStdio, blockStdio := -1, -1
+	if c.InfoFD != nil {
+		fd, err := takeFD(*c.InfoFD, flagInfoFD)
+		if err != nil {
+			return util.Errorf("%v", err)
+		}
+		infoFD = fd
+		if *c.InfoFD <= 2 {
+			infoStdio = *c.InfoFD
+		}
+		defer func() {
+			if infoFD >= 0 {
+				unix.Close(infoFD)
+			}
+		}()
+	}
+	// A --block-fd that cannot be read releases the command at once. So
+	// does one that --info-fd already used, as writing the info closes it.
+	if c.BlockFD != nil && (c.InfoFD == nil || *c.BlockFD != *c.InfoFD) {
+		if fd, err := takeFD(*c.BlockFD, flagBlockFD); err != nil {
+			log.Warningf("%v; not waiting for it", err)
+		} else {
+			blockFD = fd
+			if *c.BlockFD <= 2 {
+				blockStdio = *c.BlockFD
+			}
+		}
+	}
+	// A replaced --info-fd or --block-fd descriptor must not stay open in the
+	// runsc processes that run the sandbox. takeFD has already closed the
+	// descriptors in use.
+	for _, fd := range c.unusedFDs {
+		if fd > 2 && inherited(fd) == nil {
+			unix.CloseOnExec(fd)
+		}
+	}
+
+	// While the sandbox waits for --info-fd and --block-fd, a signal that
+	// would otherwise end runsc stops the sandbox instead of leaving it
+	// behind. A SIGINT or SIGHUP that runsc started with ignored stays
+	// ignored. The Go runtime does not keep SIGTERM and SIGQUIT ignored, so
+	// signal.Ignored cannot report them.
+	var sigCh chan os.Signal
+	if infoFD >= 0 || blockFD >= 0 {
+		sigCh = make(chan os.Signal, 1)
+		for _, sig := range []os.Signal{unix.SIGINT, unix.SIGTERM, unix.SIGHUP, unix.SIGQUIT} {
+			if !signal.Ignored(sig) {
+				signal.Notify(sigCh, sig)
+			}
+		}
+		defer signal.Stop(sigCh)
+	}
+	// stoppedBy records that sig stopped the sandbox before the command ran.
+	stoppedBy := func(sig os.Signal) subcommands.ExitStatus {
+		log.Infof("bwrap: stopping the sandbox on %v", sig)
+		*waitStatus = unix.WaitStatus(sig.(unix.Signal))
+		return subcommands.ExitSuccess
+	}
+
 	opts, err := c.prepareSandbox()
 	if err != nil {
 		return util.Errorf("%v", err)
@@ -490,6 +725,39 @@ func do(ctx context.Context, c *bwrapConfig, waitStatus *unix.WaitStatus) subcom
 		// so pass the program path separately from the argv it runs with.
 		execOpts = append(execOpts, sandbox.WithExecPath(argv[0]))
 		argv = append([]string{c.Argv0}, argv[1:]...)
+	}
+
+	// The sandbox runs before --info-fd reports its PID, and the command
+	// waits for --block-fd. A signal stops either wait, which lasts as long
+	// as the process at the other end of the descriptor wants. Once a signal
+	// stops the sandbox, nothing is written to --info-fd.
+	if infoFD >= 0 {
+		fd := infoFD
+		infoFD = -1
+		sig, err := writeInfo(ctx, sb, fd, sigCh)
+		if sig != nil {
+			return stoppedBy(sig)
+		}
+		if err != nil {
+			return util.Errorf("bwrap: %v", err)
+		}
+		if err := nullStdio(infoStdio); err != nil {
+			return util.Errorf("bwrap: %v", err)
+		}
+	}
+	if blockFD >= 0 {
+		if sig := interruptible(sigCh, func() { waitBlock(blockFD) }); sig != nil {
+			return stoppedBy(sig)
+		}
+	}
+	if sig := pendingSignal(sigCh); sig != nil {
+		return stoppedBy(sig)
+	}
+	// sigCh stays registered until do returns, so that a signal from now
+	// until sb.Exec relays signals does not end runsc and leave the sandbox
+	// behind. sb.Exec drops the signals that come before the command runs.
+	if err := nullStdio(blockStdio); err != nil {
+		return util.Errorf("bwrap: %v", err)
 	}
 
 	res, err := sb.Exec(ctx, argv, execOpts...)

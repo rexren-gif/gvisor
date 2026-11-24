@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -39,6 +40,9 @@ const (
 
 // permsPtr returns a pointer to perms, for sandbox.Mount.Mode.
 func permsPtr(perms uint32) *uint32 { return &perms }
+
+// fdPtr returns a pointer to fd, for bwrapConfig.InfoFD and BlockFD.
+func fdPtr(fd int) *int { return &fd }
 
 // wantIDMappings returns the mappings bwrap is expected to build for an
 // unshared user namespace that runs as containerID.
@@ -891,6 +895,79 @@ func TestParseFlags(t *testing.T) {
 			},
 		},
 		{
+			name: "InfoAndBlockFD",
+			args: []string{"--info-fd", "3", "--block-fd", "0", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:     os.Environ(),
+				UID:     -1,
+				GID:     -1,
+				InfoFD:  fdPtr(3),
+				BlockFD: fdPtr(0),
+				Args:    []string{"bash"},
+			},
+		},
+		{
+			// Only the last value of a repeated flag is used, and leading
+			// white space is allowed.
+			name: "RepeatedInfoAndBlockFD",
+			args: []string{"--info-fd", "5", "--info-fd", " 3", "--block-fd", "6", "--block-fd", "4", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:     os.Environ(),
+				UID:     -1,
+				GID:     -1,
+				InfoFD:  fdPtr(3),
+				BlockFD: fdPtr(4),
+				Args:    []string{"bash"},
+			},
+		},
+		{
+			name:        "InfoFDTooLarge",
+			args:        []string{"--info-fd", "2147483648", "bash"},
+			errContains: "Invalid fd: 2147483648",
+		},
+		{
+			name:        "InfoFDEmpty",
+			args:        []string{"--info-fd", "", "bash"},
+			errContains: "Invalid fd: ",
+		},
+		{
+			name:        "InfoFDTrailingSpace",
+			args:        []string{"--info-fd", "3 ", "bash"},
+			errContains: "Invalid fd: 3 ",
+		},
+		{
+			name: "FDSigns",
+			args: []string{"--info-fd", "+3", "--block-fd", "-0", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:     os.Environ(),
+				UID:     -1,
+				GID:     -1,
+				InfoFD:  fdPtr(3),
+				BlockFD: fdPtr(0),
+				Args:    []string{"bash"},
+			},
+		},
+		{
+			name:        "InfoFDNotANumber",
+			args:        []string{"--info-fd", "abc", "bash"},
+			errContains: "Invalid fd: abc",
+		},
+		{
+			name:        "BlockFDNegative",
+			args:        []string{"--block-fd", "-1", "bash"},
+			errContains: "Invalid fd: -1",
+		},
+		{
+			name:        "MissingInfoFDArg",
+			args:        []string{"--info-fd"},
+			errContains: "--info-fd takes 1 argument",
+		},
+		{
+			name:        "MissingBlockFDArg",
+			args:        []string{"--block-fd"},
+			errContains: "--block-fd takes 1 argument",
+		},
+		{
 			name:        "MissingDirArg",
 			args:        []string{"--dir"},
 			errContains: "--dir takes 1 argument",
@@ -1168,4 +1245,143 @@ func mkdirMode(t *testing.T, path string, mode os.FileMode) {
 	if err := os.Chmod(path, mode); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestParseReplacedFD checks that a repeated --info-fd or --block-fd records
+// the descriptor it replaces, also when it gives the same descriptor again.
+func TestParseReplacedFD(t *testing.T) {
+	cfg, err := parseBwrapArgs([]string{"--info-fd", "3", "--info-fd", "3", "--block-fd", "6", "--block-fd", "4", "bash"})
+	if err != nil {
+		t.Fatalf("parseBwrapArgs failed: %v", err)
+	}
+	if *cfg.InfoFD != 3 || *cfg.BlockFD != 4 {
+		t.Errorf("InfoFD, BlockFD = %d, %d, want 3, 4", *cfg.InfoFD, *cfg.BlockFD)
+	}
+	if diff := cmp.Diff(cfg.unusedFDs, []int{3, 6}); diff != "" {
+		t.Errorf("unusedFDs mismatch (-got +want):\n%s", diff)
+	}
+}
+
+// TestWaitBlock checks what releases waitBlock.
+func TestWaitBlock(t *testing.T) {
+	// pipe returns a pipe with flags on the read end. It closes the write end
+	// when the test ends.
+	pipe := func(t *testing.T, flags int) (int, int) {
+		t.Helper()
+		var p [2]int
+		if err := unix.Pipe2(p[:], flags); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { unix.Close(p[1]) })
+		return p[0], p[1]
+	}
+	// wait runs waitBlock and fails the test if it does not return in time.
+	wait := func(t *testing.T, fd int) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			waitBlock(fd)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("waitBlock did not return")
+		}
+	}
+
+	t.Run("Data", func(t *testing.T) {
+		r, w := pipe(t, unix.O_CLOEXEC|unix.O_NONBLOCK)
+		// dup keeps the pipe open after waitBlock closes r.
+		dup, err := unix.Dup(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(dup)
+		if _, err := unix.Write(w, []byte("xy")); err != nil {
+			t.Fatal(err)
+		}
+		wait(t, r)
+		if _, err := unix.FcntlInt(uintptr(r), unix.F_GETFD, 0); err != unix.EBADF {
+			t.Errorf("fd %d is open after waitBlock: %v", r, err)
+		}
+		var b [8]byte
+		if n, err := unix.Read(dup, b[:]); err != nil || string(b[:n]) != "y" {
+			t.Errorf("pipe has %q (err: %v) after waitBlock, want \"y\"", b[:n], err)
+		}
+	})
+	t.Run("Blocks", func(t *testing.T) {
+		r, w := pipe(t, unix.O_CLOEXEC)
+		done := make(chan struct{})
+		go func() {
+			waitBlock(r)
+			close(done)
+		}()
+		select {
+		case <-done:
+			t.Fatalf("waitBlock returned before fd had data")
+		case <-time.After(100 * time.Millisecond):
+		}
+		if _, err := unix.Write(w, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("waitBlock did not return after fd had data")
+		}
+	})
+	t.Run("EOF", func(t *testing.T) {
+		var p [2]int
+		if err := unix.Pipe2(p[:], unix.O_CLOEXEC); err != nil {
+			t.Fatal(err)
+		}
+		unix.Close(p[1])
+		wait(t, p[0])
+	})
+	t.Run("NonBlocking", func(t *testing.T) {
+		r, _ := pipe(t, unix.O_CLOEXEC|unix.O_NONBLOCK)
+		wait(t, r)
+	})
+}
+
+// TestInterruptible checks that interruptible returns when fn returns or a
+// signal comes, whichever is first.
+func TestInterruptible(t *testing.T) {
+	t.Run("Returns", func(t *testing.T) {
+		ran := false
+		if sig := interruptible(make(chan os.Signal, 1), func() { ran = true }); sig != nil || !ran {
+			t.Errorf("interruptible = %v, ran = %t, want nil, true", sig, ran)
+		}
+	})
+	t.Run("PendingSignal", func(t *testing.T) {
+		sigCh := make(chan os.Signal, 1)
+		sigCh <- unix.SIGTERM
+		ran := make(chan struct{}, 1)
+		if sig := interruptible(sigCh, func() { ran <- struct{}{} }); sig != unix.SIGTERM {
+			t.Errorf("interruptible = %v, want %v", sig, unix.SIGTERM)
+		}
+		select {
+		case <-ran:
+			t.Errorf("fn ran with a signal pending")
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+	t.Run("SignalWhileRunning", func(t *testing.T) {
+		sigCh := make(chan os.Signal, 1)
+		release := make(chan struct{})
+		defer close(release)
+		started := make(chan struct{})
+		go func() {
+			<-started
+			sigCh <- unix.SIGINT
+		}()
+		sig := interruptible(sigCh, func() {
+			close(started)
+			<-release
+		})
+		if sig != unix.SIGINT {
+			t.Errorf("interruptible = %v, want %v", sig, unix.SIGINT)
+		}
+	})
 }

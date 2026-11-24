@@ -16,8 +16,10 @@ package sandbox_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -93,6 +95,32 @@ func TestSandboxOptions(t *testing.T) {
 
 	if got := sb.Bundle(); !strings.HasPrefix(got, runtimeDir) {
 		t.Errorf("sb.Bundle() = %v; want prefix %v", got, runtimeDir)
+	}
+}
+
+func TestPID(t *testing.T) {
+	ctx := context.Background()
+	sb, err := sandbox.New(ctx)
+	if err != nil {
+		t.Fatalf("failed to create sandbox: %v", err)
+	}
+	defer func() {
+		if err := sb.Close(ctx); err != nil {
+			t.Fatalf("failed to clean up sandbox: %v", err)
+		}
+	}()
+
+	pid, err := sb.PID(ctx)
+	if err != nil {
+		t.Fatalf("sb.PID() failed: %v", err)
+	}
+	// The sandbox process runs `runsc boot`, unlike the gofer process.
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		t.Fatalf("sb.PID() = %d, which is not a running process: %v", pid, err)
+	}
+	if args := strings.Split(string(data), "\x00"); !slices.Contains(args, "boot") {
+		t.Errorf("sb.PID() = %d, whose command line is %q, want a runsc boot command", pid, args)
 	}
 }
 

@@ -62,6 +62,8 @@ const (
 	flagDir           = "dir"
 	flagAsPID1        = "as-pid-1"
 	flagDev           = "dev"
+	flagInfoFD        = "info-fd"
+	flagBlockFD       = "block-fd"
 )
 
 // Cli implements subcommands.Command for the "bwrap" command.
@@ -94,6 +96,8 @@ type Cli struct {
 	dir           string
 	asPID1        bool
 	dev           string
+	infoFD        string
+	blockFD       string
 }
 
 // Name implements subcommands.Command.Name.
@@ -140,6 +144,8 @@ func (c *Cli) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.dir, flagDir, "", "Create dir at DEST")
 	f.BoolVar(&c.asPID1, flagAsPID1, false, "Do not install a reaper process with PID=1")
 	f.StringVar(&c.dev, flagDev, "", "Mount new dev on DEST")
+	f.StringVar(&c.infoFD, flagInfoFD, "", "Write the host PID of the sandbox process as JSON to FD, then close FD")
+	f.StringVar(&c.blockFD, flagBlockFD, "", "Wait for data or end of file on FD before running COMMAND")
 
 	// Override the default usage function to print the custom usage message.
 	f.Usage = func() {
@@ -237,6 +243,10 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 			i, err = cfg.parseAsPID1(bwrapArgs, i)
 		case flagDev:
 			i, err = cfg.parseDev(bwrapArgs, i)
+		case flagInfoFD:
+			i, err = cfg.parseFD(bwrapArgs, i, flagInfoFD, &cfg.InfoFD)
+		case flagBlockFD:
+			i, err = cfg.parseFD(bwrapArgs, i, flagBlockFD, &cfg.BlockFD)
 		default:
 			return nil, fmt.Errorf("bwrap: Unknown option: %s", arg)
 		}
@@ -480,6 +490,24 @@ func (c *bwrapConfig) parseDev(args []string, i int) (int, error) {
 	}
 	c.Mounts = append(c.Mounts, dev, pts)
 
+	return i + 2, nil
+}
+
+// parseFD handles --info-fd FD and --block-fd FD, and stores FD in fd. Only
+// the last FD of a repeated flag is used.
+func (c *bwrapConfig) parseFD(args []string, i int, name string, fd **int) (int, error) {
+	if i+1 >= len(args) {
+		return i, fmt.Errorf("bwrap: --%s takes 1 argument", name)
+	}
+	n, err := strconv.ParseInt(strings.TrimLeft(args[i+1], " \t\n\v\f\r"), 10, 32)
+	if err != nil || n < 0 {
+		return i, fmt.Errorf("bwrap: Invalid fd: %s", args[i+1])
+	}
+	if *fd != nil {
+		c.unusedFDs = append(c.unusedFDs, **fd)
+	}
+	v := int(n)
+	*fd = &v
 	return i + 2, nil
 }
 

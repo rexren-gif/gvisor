@@ -427,8 +427,18 @@ func TestSubDirPath(t *testing.T) {
 
 // TestParseFlags tests the parsing of bwrap flags.
 func TestParseFlags(t *testing.T) {
-	// mntSrc is a host directory for --bind and --ro-bind sources.
+	// mntSrc is a host directory for bind mount sources.
 	mntSrc := t.TempDir()
+	// mntSrcFile is a regular file inside mntSrc.
+	mntSrcFile := filepath.Join(mntSrc, "file")
+	if err := os.WriteFile(mntSrcFile, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// mntSrcDangling is a symlink inside mntSrc to a missing path.
+	mntSrcDangling := filepath.Join(mntSrc, "dangling")
+	if err := os.Symlink(filepath.Join(mntSrc, "missing"), mntSrcDangling); err != nil {
+		t.Fatal(err)
+	}
 	// rootBind is the mount --ro-bind / / produces.
 	rootBind := sandbox.Mount{Type: sandbox.MountTypeBind, Source: "/", Destination: "/", ReadOnly: true, Recursive: true, Private: true, NoSuid: true, NoDev: true}
 
@@ -889,6 +899,252 @@ func TestParseFlags(t *testing.T) {
 				GID:  -1,
 				Args: []string{"bash"},
 			},
+		},
+		{
+			name: "BindTry",
+			args: []string{"--bind-try", mntSrc, "/mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			name: "RoBindTry",
+			args: []string{"--ro-bind-try", mntSrc, "/mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt", ReadOnly: true}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			// A missing SRC drops the mount, and parsing carries on with the
+			// next flag.
+			name: "BindTryMissingSource",
+			args: []string{"--bind-try", mntSrc + "/missing", "/mnt", "--ro-bind-try", mntSrc + "/missing", "/opt", "--tmpfs", "/tmp", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/tmp"}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			// A dangling symlink is a missing SRC.
+			name: "BindTryDanglingSymlink",
+			args: []string{"--bind-try", mntSrcDangling, "/mnt", "--ro-bind-try", mntSrcDangling, "/opt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:  os.Environ(),
+				UID:  -1,
+				GID:  -1,
+				Args: []string{"bash"},
+			},
+		},
+		{
+			// SRC is checked first, so DEST does not matter when SRC is
+			// missing.
+			name: "BindTryMissingSourceEmptyDest",
+			args: []string{"--bind-try", mntSrc + "/missing", "", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:  os.Environ(),
+				UID:  -1,
+				GID:  -1,
+				Args: []string{"bash"},
+			},
+		},
+		{
+			// A --dir below a sibling with the same prefix does not create
+			// SRC.
+			name: "BindTrySourceFromSiblingDir",
+			args: []string{"--bind", mntSrc, "/mnt", "--dir", "/mnt/newdir", "--ro-bind-try", mntSrc + "/new", "/opt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"}},
+				HostDirs: []HostDir{{Dest: "/mnt/newdir", Path: mntSrc + "/newdir", Perms: 0755}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// A --dir under a read-only bind cannot create SRC.
+			name: "BindTrySourceFromReadOnlyDir",
+			args: []string{"--ro-bind", mntSrc, "/mnt", "--dir", "/mnt/new", "--bind-try", mntSrc + "/new", "/opt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt", ReadOnly: true}},
+				HostDirs: []HostDir{{Dest: "/mnt/new", Path: mntSrc + "/new", ReadOnly: true, Perms: 0755}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// A --dir declared after the -try flag does not count.
+			name: "BindTrySourceFromLaterDir",
+			args: []string{"--ro-bind-try", mntSrc + "/new", "/opt", "--bind", mntSrc, "/mnt", "--dir", "/mnt/new", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"}},
+				HostDirs: []HostDir{{Dest: "/mnt/new", Path: mntSrc + "/new", Perms: 0755}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// --bind and --ro-bind need SRC to exist when the command line is
+			// parsed.
+			name:        "BindSourceFromDir",
+			args:        []string{"--bind", mntSrc, "/mnt", "--dir", "/mnt/new", "--ro-bind", mntSrc + "/new", "/opt", "bash"},
+			errContains: "Can't find source path",
+		},
+		{
+			// An earlier --dir creates SRC on the host before the sandbox
+			// starts, so the mount is kept.
+			name: "BindTrySourceFromDir",
+			args: []string{"--bind", mntSrc, "/mnt", "--dir", "/mnt/new/sub", "--ro-bind-try", mntSrc + "/new", "/opt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"},
+					{Type: sandbox.MountTypeBind, Source: mntSrc + "/new", Destination: "/opt", ReadOnly: true},
+				},
+				HostDirs: []HostDir{{Dest: "/mnt/new/sub", Path: mntSrc + "/new/sub", Perms: 0755}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// SRC is checked as given, so a ".." after a missing component
+			// does not reach the existing mntSrc.
+			name:        "BindMissingDotDot",
+			args:        []string{"--bind", mntSrc + "/missing/..", "/mnt", "bash"},
+			errContains: "Can't find source path",
+		},
+		{
+			name: "BindTryMissingDotDot",
+			args: []string{"--bind-try", mntSrc + "/missing/..", "/mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:  os.Environ(),
+				UID:  -1,
+				GID:  -1,
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name:        "BindFileWithSlash",
+			args:        []string{"--ro-bind", mntSrcFile + "/", "/mnt", "bash"},
+			errContains: "not a directory",
+		},
+		{
+			// A ".." can hide a component that stays missing, so a SRC with
+			// one must exist when the command line is parsed.
+			name: "BindTrySourceFromDirDotDot",
+			args: []string{"--bind", mntSrc, "/mnt", "--dir", "/mnt/new", "--ro-bind-try", mntSrc + "/new/missing/..", "/opt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"}},
+				HostDirs: []HostDir{{Dest: "/mnt/new", Path: mntSrc + "/new", Perms: 0755}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// --dir leaves a dangling symlink at its path as it is, so it
+			// does not create SRC.
+			name: "BindTrySourceFromDirDanglingSymlink",
+			args: []string{"--bind", mntSrc, "/mnt", "--dir", "/mnt/dangling", "--ro-bind-try", mntSrcDangling, "/opt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"}},
+				HostDirs: []HostDir{{Dest: "/mnt/dangling", Path: mntSrcDangling, Perms: 0755}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// A trailing "/" or "/." makes the kernel follow the dangling
+			// symlink, which the check must still see.
+			name: "BindTrySourceFromDirDanglingSymlinkSlash",
+			args: []string{"--bind", mntSrc, "/mnt", "--dir", "/mnt/dangling", "--ro-bind-try", mntSrcDangling + "/", "/opt", "--bind-try", mntSrcDangling + "/.", "/srv", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"}},
+				HostDirs: []HostDir{{Dest: "/mnt/dangling", Path: mntSrcDangling, Perms: 0755}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			name:        "BindEmptyDest",
+			args:        []string{"--bind", mntSrc, "", "bash"},
+			errContains: "destination path is empty",
+		},
+		{
+			name:        "BindTryEmptyDest",
+			args:        []string{"--bind-try", mntSrc, "", "bash"},
+			errContains: "destination path is empty",
+		},
+		{
+			// SRC below the --dir is not created.
+			name: "BindTrySourceBelowDir",
+			args: []string{"--bind", mntSrc, "/mnt", "--dir", "/mnt/new", "--ro-bind-try", mntSrc + "/new/sub", "/opt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"}},
+				HostDirs: []HostDir{{Dest: "/mnt/new", Path: mntSrc + "/new", Perms: 0755}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// Only a missing SRC is skipped. A path through a regular file
+			// fails with ENOTDIR.
+			name:        "BindTryNotDir",
+			args:        []string{"--ro-bind-try", mntSrcFile + "/child", "/mnt", "bash"},
+			errContains: "not a directory",
+		},
+		{
+			name:        "BindMissingSource",
+			args:        []string{"--bind", mntSrc + "/missing", "/mnt", "bash"},
+			errContains: "Can't find source path",
+		},
+		{
+			name:        "BindDanglingSymlink",
+			args:        []string{"--ro-bind", mntSrcDangling, "/mnt", "bash"},
+			errContains: "Can't find source path",
+		},
+		{
+			name:        "BindEmptySource",
+			args:        []string{"--bind", "", "/mnt", "bash"},
+			errContains: "source path is empty",
+		},
+		{
+			name:        "BindTryEmptySource",
+			args:        []string{"--ro-bind-try", "", "/mnt", "bash"},
+			errContains: "source path is empty",
+		},
+		{
+			name:        "MissingBindTryArgs",
+			args:        []string{"--bind-try", mntSrc},
+			errContains: "--bind-try takes 2 arguments",
+		},
+		{
+			name:        "MissingRoBindTryArgs",
+			args:        []string{"--ro-bind-try", mntSrc},
+			errContains: "--ro-bind-try takes 2 arguments",
 		},
 		{
 			name:        "MissingDirArg",

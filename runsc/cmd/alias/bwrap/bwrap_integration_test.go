@@ -176,6 +176,84 @@ func TestBind(t *testing.T) {
 	}
 }
 
+// TestBindTry checks that --bind-try and --ro-bind-try mount an existing SRC
+// and skip a missing one.
+func TestBindTry(t *testing.T) {
+	if err := testutil.ConfigureExePath(); err != nil {
+		t.Fatalf("failed to configure exe path: %v", err)
+	}
+	for _, dir := range []string{"/mnt", "/opt"} {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Fatalf("bind destination %s is not a directory: %v", dir, err)
+		}
+	}
+	stop := testutil.StartReaper()
+	defer stop()
+
+	workDir := t.TempDir()
+	const contents = "bind-try contents\n"
+	if err := os.WriteFile(filepath.Join(workDir, "input"), []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// keep holds a file that a skipped mount at /mnt/keep must leave visible.
+	if err := os.Mkdir(filepath.Join(workDir, "keep"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "keep", "marker"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(workDir, "missing")
+	cmd := exec.Command(specutils.ExePath,
+		"--root", newRunRootDir(t), "bwrap",
+		"--ro-bind", "/", "/",
+		"--bind-try", workDir, "/mnt",
+		"--bind-try", missing, "/mnt/keep",
+		"--ro-bind-try", missing, "/mnt/keep",
+		// A skipped mount creates no mount point on the host.
+		"--bind-try", missing, "/mnt/newdest",
+		// --dir creates newdir on the host, so the mount at /opt is kept.
+		"--dir", "/mnt/newdir",
+		"--ro-bind-try", filepath.Join(workDir, "newdir"), "/opt",
+		"--", "/bin/sh", "-ec",
+		"cat /mnt/input; cp /mnt/input /mnt/output; test -e /mnt/keep/marker; "+
+			"touch /mnt/newdir/probe; test -e /opt/probe; ! touch /opt/denied 2>/dev/null")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := testutil.RunCmd(cmd); err != nil {
+		t.Fatalf("runsc bwrap failed: %v\nStderr: %s", err, stderr.String())
+	}
+	if got := stdout.String(); got != contents {
+		t.Errorf("bind mount contents = %q, want %q", got, contents)
+	}
+	if output, err := os.ReadFile(filepath.Join(workDir, "output")); err != nil {
+		t.Errorf("--bind-try mount is not writable: %v", err)
+	} else if string(output) != contents {
+		t.Errorf("written bind mount contents = %q, want %q", output, contents)
+	}
+	// runsc parses the leading flags with Go's flag package before the bwrap
+	// parser runs, so check that a command line can start with each -try flag.
+	for _, name := range []string{"--bind-try", "--ro-bind-try"} {
+		cmd := exec.Command(specutils.ExePath,
+			"--root", newRunRootDir(t), "bwrap",
+			name, missing, "/mnt",
+			"--ro-bind", "/", "/",
+			"--", "/bin/true")
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := testutil.RunCmd(cmd); err != nil {
+			t.Errorf("runsc bwrap %s failed: %v\nStderr: %s", name, err, stderr.String())
+		}
+	}
+	for _, path := range []string{missing, filepath.Join(workDir, "newdest")} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s exists after the run: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "newdir", "denied")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("--ro-bind-try mount is writable: %v", err)
+	}
+}
+
 func TestUserAndGroup(t *testing.T) {
 	if err := testutil.ConfigureExePath(); err != nil {
 		t.Fatalf("failed to configure exe path: %v", err)

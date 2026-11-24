@@ -16,7 +16,9 @@ package bwrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +36,8 @@ import (
 const (
 	flagBind          = "bind"
 	flagRoBind        = "ro-bind"
+	flagBindTry       = "bind-try"
+	flagRoBindTry     = "ro-bind-try"
 	flagTmpfs         = "tmpfs"
 	flagUnshareNet    = "unshare-net"
 	flagChdir         = "chdir"
@@ -69,6 +73,8 @@ type Cli struct {
 	// Placeholders for bwrap flags.
 	bind          string
 	roBind        string
+	bindTry       string
+	roBindTry     string
 	tmpfs         string
 	unshareNet    bool
 	chdir         string
@@ -115,6 +121,8 @@ func (*Cli) Usage() string {
 func (c *Cli) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.bind, flagBind, "", "Bind mount SRC to DEST.")
 	f.StringVar(&c.roBind, flagRoBind, "", "Read-only bind mount SRC to DEST.")
+	f.StringVar(&c.bindTry, flagBindTry, "", "Equal to --bind but ignores non-existent SRC.")
+	f.StringVar(&c.roBindTry, flagRoBindTry, "", "Equal to --ro-bind but ignores non-existent SRC.")
 	f.StringVar(&c.tmpfs, flagTmpfs, "", "Mount tmpfs at DEST.")
 	f.BoolVar(&c.unshareNet, flagUnshareNet, false, "Unshare network namespace.")
 	f.StringVar(&c.chdir, flagChdir, "", "Change directory to DIR.")
@@ -189,10 +197,8 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 		// Parse the flags.
 		strippedArg := strings.TrimPrefix(arg, "--")
 		switch strippedArg {
-		case flagBind:
-			i, err = cfg.parseBind(bwrapArgs, i)
-		case flagRoBind:
-			i, err = cfg.parseRoBind(bwrapArgs, i)
+		case flagBind, flagRoBind, flagBindTry, flagRoBindTry:
+			i, err = cfg.parseBindMount(bwrapArgs, i)
 		case flagTmpfs:
 			i, err = cfg.parseTmpfs(bwrapArgs, i)
 		case flagUnshareNet:
@@ -284,23 +290,20 @@ func (c *Cli) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcomm
 Flags parsing functions below.
 */
 
-func (c *bwrapConfig) parseBind(args []string, i int) (int, error) {
+// parseBindMount handles --bind, --ro-bind, --bind-try and --ro-bind-try.
+// The -try forms skip the mount when SRC does not exist.
+// Other errors with SRC fail.
+func (c *bwrapConfig) parseBindMount(args []string, i int) (int, error) {
+	name := strings.TrimPrefix(args[i], "--")
+	readOnly := name == flagRoBind || name == flagRoBindTry
+	try := name == flagBindTry || name == flagRoBindTry
 	if i+2 >= len(args) {
-		return i, fmt.Errorf("bwrap: --%s takes 2 arguments", flagBind)
+		return i, fmt.Errorf("bwrap: --%s takes 2 arguments", name)
 	}
-	mnt, err := c.newMount(args[i+1], args[i+2], sandbox.MountTypeBind, false /* readOnly */)
-	if err != nil {
-		return i, err
+	mnt, err := c.newBindMount(args[i+1], args[i+2], readOnly, try)
+	if try && errors.Is(err, fs.ErrNotExist) {
+		return i + 3, nil
 	}
-	c.Mounts = append(c.Mounts, mnt)
-	return i + 3, nil
-}
-
-func (c *bwrapConfig) parseRoBind(args []string, i int) (int, error) {
-	if i+2 >= len(args) {
-		return i, fmt.Errorf("bwrap: --%s takes 2 arguments", flagRoBind)
-	}
-	mnt, err := c.newMount(args[i+1], args[i+2], sandbox.MountTypeBind, true /* readOnly */)
 	if err != nil {
 		return i, err
 	}

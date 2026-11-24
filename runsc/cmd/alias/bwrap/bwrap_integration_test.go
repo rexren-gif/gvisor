@@ -1196,3 +1196,271 @@ func TestDev(t *testing.T) {
 		})
 	}
 }
+
+// TestRemountRO checks that --remount-ro makes the mount at DEST read-only,
+// and leaves the mounts below DEST writable.
+func TestRemountRO(t *testing.T) {
+	if err := testutil.ConfigureExePath(); err != nil {
+		t.Fatalf("failed to configure exe path: %v", err)
+	}
+	if info, err := os.Stat("/mnt"); err != nil || !info.IsDir() {
+		t.Fatalf("mount destination /mnt is not a directory: %v", err)
+	}
+	stop := testutil.StartReaper()
+	defer stop()
+
+	// tmpfsRoot binds the host directories that /bin/sh needs into a tmpfs
+	// root.
+	var tmpfsRoot []string
+	for _, dir := range []string{"/usr", "/bin", "/lib", "/lib64", "/etc"} {
+		if _, err := os.Stat(dir); err == nil {
+			tmpfsRoot = append(tmpfsRoot, "--ro-bind", dir, dir)
+		}
+	}
+	rootBind := []string{"--ro-bind", "/", "/"}
+	// with returns base followed by args.
+	with := func(base []string, args ...string) []string {
+		return append(slices.Clone(base), args...)
+	}
+
+	// hostDir stands in for a fresh writable host directory.
+	const hostDir = "HOST_DIR"
+	tests := []struct {
+		name      string
+		bwrapArgs []string
+		script    string
+		// wantHostFile is a file under hostDir that the script must create.
+		wantHostFile string
+		// wantNoHostFile is a file under hostDir that the script must not
+		// create.
+		wantNoHostFile string
+		// wantErr, if set, is text the failed run's stderr must contain.
+		wantErr string
+	}{
+		{
+			name:      "Tmpfs",
+			bwrapArgs: with(rootBind, "--tmpfs", "/mnt", "--remount-ro", "/mnt"),
+			script:    "! touch /mnt/file 2>/dev/null",
+		},
+		{
+			// A mode that grants write access does not make a read-only
+			// mount writable, even to root.
+			name:      "PermsTmpfs",
+			bwrapArgs: with(rootBind, "--perms", "0777", "--tmpfs", "/mnt", "--remount-ro", "/mnt"),
+			script:    `test "$(stat -c %a /mnt)" = 777; ! touch /mnt/file 2>/dev/null`,
+		},
+		{
+			name:      "PermsTmpfsWritable",
+			bwrapArgs: with(rootBind, "--perms", "0777", "--tmpfs", "/mnt"),
+			script:    `test "$(stat -c %a /mnt)" = 777; touch /mnt/file`,
+		},
+		{
+			name:      "PermsDir",
+			bwrapArgs: with(rootBind, "--tmpfs", "/mnt", "--perms", "0777", "--dir", "/mnt/dir", "--remount-ro", "/mnt"),
+			script:    `test "$(stat -c %a /mnt/dir)" = 777; ! touch /mnt/dir/file 2>/dev/null`,
+		},
+		{
+			// The read-only tmpfs hides the earlier writable bind below it.
+			name:           "HiddenBind",
+			bwrapArgs:      with(rootBind, "--bind", hostDir, "/mnt/sub", "--tmpfs", "/mnt", "--remount-ro", "/mnt"),
+			script:         "test ! -e /mnt/sub && ! touch /mnt/sub 2>/dev/null",
+			wantNoHostFile: "sub",
+		},
+		{
+			// runsc keeps a devpts at /dev/pts under a tmpfs at /dev. It is
+			// read-only, like the tmpfs.
+			name:      "DevPtsUnderTmpfs",
+			bwrapArgs: with(rootBind, "--tmpfs", "/dev", "--remount-ro", "/dev"),
+			script:    "grep ' /dev/pts ' /proc/mounts | tail -1 | grep ' ro[ ,]'",
+		},
+		{
+			// The root bind hides the earlier tmpfs, so the default /tmp is
+			// the read-only mount there.
+			name:      "DefaultUnderHiddenMount",
+			bwrapArgs: []string{"--tmpfs", "/tmp", "--ro-bind", "/", "/", "--remount-ro", "/tmp"},
+			script:    "grep -q ' /tmp tmpfs ro[ ,]' /proc/mounts && ! touch /tmp/file 2>/dev/null",
+		},
+		{
+			// The tmpfs hides the default mount at /sys/fs/cgroup.
+			name:      "HiddenDefault",
+			bwrapArgs: with(rootBind, "--tmpfs", "/sys", "--remount-ro", "/sys"),
+			script:    "test ! -e /sys/fs && ! touch /sys/file 2>/dev/null",
+		},
+		{
+			name:           "Bind",
+			bwrapArgs:      with(rootBind, "--bind", hostDir, "/mnt", "--remount-ro", "/mnt"),
+			script:         "! touch /mnt/file 2>/dev/null",
+			wantNoHostFile: "file",
+		},
+		{
+			name:         "WritableSubmount",
+			bwrapArgs:    with(rootBind, "--tmpfs", "/mnt", "--bind", hostDir, "/mnt/sub", "--remount-ro", "/mnt"),
+			script:       "touch /mnt/sub/file; ! touch /mnt/file 2>/dev/null",
+			wantHostFile: "file",
+		},
+		{
+			// A mount declared after --remount-ro at the same DEST stays
+			// writable.
+			name:         "LaterMount",
+			bwrapArgs:    with(rootBind, "--tmpfs", "/mnt", "--remount-ro", "/mnt", "--bind", hostDir, "/mnt"),
+			script:       "touch /mnt/file",
+			wantHostFile: "file",
+		},
+		{
+			// A --dir in the remounted filesystem is read-only with it.
+			name:      "Dir",
+			bwrapArgs: with(rootBind, "--tmpfs", "/mnt", "--dir", "/mnt/dir", "--remount-ro", "/mnt"),
+			script:    "test -d /mnt/dir; ! touch /mnt/dir/file 2>/dev/null",
+		},
+		{
+			// A --dir under a bind is created on the host before the bind
+			// becomes read-only.
+			name:         "HostDirBefore",
+			bwrapArgs:    with(rootBind, "--bind", hostDir, "/mnt", "--dir", "/mnt/new", "--remount-ro", "/mnt"),
+			script:       "test -d /mnt/new; ! touch /mnt/new/file 2>/dev/null",
+			wantHostFile: "new",
+		},
+		{
+			name:           "HostDirAfter",
+			bwrapArgs:      with(rootBind, "--bind", hostDir, "/mnt", "--remount-ro", "/mnt", "--dir", "/mnt/new"),
+			wantErr:        "Can't mkdir /mnt/new: read-only file system",
+			wantNoHostFile: "new",
+		},
+		{
+			name:      "TmpfsDirAfter",
+			bwrapArgs: with(rootBind, "--tmpfs", "/mnt", "--remount-ro", "/mnt", "--dir", "/mnt/new"),
+			wantErr:   "Can't mkdir /mnt/new: read-only file system",
+		},
+		{
+			name:      "Dev",
+			bwrapArgs: with(rootBind, "--dev", "/dev", "--remount-ro", "/dev"),
+			script:    "echo x > /dev/null; ! touch /dev/file 2>/dev/null",
+		},
+		{
+			name:      "DevWritable",
+			bwrapArgs: with(rootBind, "--dev", "/dev"),
+			script:    "touch /dev/file",
+		},
+		{
+			// --remount-ro does not reach /dev/pts, a mount below /dev.
+			name:      "DevPtsWritable",
+			bwrapArgs: with(rootBind, "--remount-ro", "/dev"),
+			script:    "grep ' /dev/pts ' /proc/mounts | grep -v ' ro[ ,]'",
+		},
+		{
+			// A --dir in a read-only dev filesystem is a read-only directory.
+			name:      "DirInDev",
+			bwrapArgs: with(rootBind, "--remount-ro", "/dev", "--dir", "/dev/foo"),
+			script:    "test -d /dev/foo; ! touch /dev/foo/file 2>/dev/null",
+		},
+		{
+			// A --dev after --remount-ro mounts a new writable one on top.
+			name:      "DevAfter",
+			bwrapArgs: with(rootBind, "--remount-ro", "/dev/pts", "--dev", "/dev"),
+			script:    "echo x > /dev/null; touch /dev/file; grep ' /dev/pts ' /proc/mounts | tail -1 | grep -v ' ro[ ,]'",
+		},
+		{
+			name:      "DefaultTmp",
+			bwrapArgs: with(rootBind, "--remount-ro", "/tmp"),
+			script:    "! touch /tmp/file 2>/dev/null",
+		},
+		{
+			name:      "Proc",
+			bwrapArgs: with(rootBind, "--remount-ro", "/proc"),
+			script:    "! sh -c 'echo x > /proc/self/comm' 2>/dev/null",
+		},
+		{
+			name:      "ProcAfter",
+			bwrapArgs: with(rootBind, "--remount-ro", "/proc", "--proc", "/proc"),
+			script:    "echo x > /proc/self/comm",
+		},
+		{
+			name:      "TmpfsRoot",
+			bwrapArgs: with(tmpfsRoot, "--remount-ro", "/", "--tmpfs", "/mnt"),
+			script:    "touch /mnt/file /tmp/file; ! touch /file 2>/dev/null",
+		},
+		{
+			name:      "TmpfsRootDir",
+			bwrapArgs: with(tmpfsRoot, "--dir", "/foo", "--remount-ro", "/"),
+			script:    "test -d /foo; ! touch /foo/file 2>/dev/null",
+		},
+		{
+			name:      "TmpfsRootWritable",
+			bwrapArgs: tmpfsRoot,
+			script:    "touch /file",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			args := []string{"--root", newRunRootDir(t), "bwrap"}
+			for _, arg := range tc.bwrapArgs {
+				if arg == hostDir {
+					arg = dir
+				}
+				args = append(args, arg)
+			}
+			args = append(args, "--", "/bin/sh", "-ec", tc.script)
+			cmd := exec.Command(specutils.ExePath, args...)
+			// Start from "/", so that the working directory is not under a
+			// read-only DEST.
+			cmd.Dir = "/"
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			err := testutil.RunCmd(cmd)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("runsc bwrap failed: %v\nStderr: %s", err, stderr.String())
+			case tc.wantErr != "" && err == nil:
+				t.Fatalf("runsc bwrap succeeded, want an error containing %q", tc.wantErr)
+			case tc.wantErr != "" && !strings.Contains(stderr.String(), tc.wantErr):
+				t.Fatalf("stderr = %q, want it to contain %q", stderr.String(), tc.wantErr)
+			}
+			if tc.wantHostFile != "" {
+				if _, err := os.Stat(filepath.Join(dir, tc.wantHostFile)); err != nil {
+					t.Errorf("host file %s: %v", tc.wantHostFile, err)
+				}
+			}
+			if tc.wantNoHostFile != "" {
+				if _, err := os.Stat(filepath.Join(dir, tc.wantNoHostFile)); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("host file %s exists, want ENOENT: %v", tc.wantNoHostFile, err)
+				}
+			}
+		})
+	}
+}
+
+// TestRemountROBindRoot checks that --remount-ro / makes a writable root bind
+// read-only.
+func TestRemountROBindRoot(t *testing.T) {
+	if err := testutil.ConfigureExePath(); err != nil {
+		t.Fatalf("failed to configure exe path: %v", err)
+	}
+	stop := testutil.StartReaper()
+	defer stop()
+
+	// dir is a host directory that the test can write. Its host mount, "/" or
+	// one below it, becomes read-only with the root bind.
+	dir, err := os.MkdirTemp("/var/tmp", "bwrap-remount-ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	// A writable root bind of the host root cannot serve as a control run:
+	// runsc fails to create the gofer's filestore files for it.
+	file := filepath.Join(dir, "file")
+	cmd := exec.Command(specutils.ExePath,
+		"--root", newRunRootDir(t), "bwrap",
+		"--bind", "/", "/", "--remount-ro", "/",
+		"--", "/bin/sh", "-ec", "! touch "+file+" 2>/dev/null")
+	cmd.Dir = "/"
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := testutil.RunCmd(cmd); err != nil {
+		t.Fatalf("runsc bwrap failed: %v\nStderr: %s", err, stderr.String())
+	}
+	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("%s exists after the run, want ENOENT: %v", file, err)
+	}
+}

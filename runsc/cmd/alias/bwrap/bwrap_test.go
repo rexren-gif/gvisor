@@ -105,13 +105,10 @@ func TestSandboxOptions(t *testing.T) {
 				Root: &specs.Root{Path: "/", Readonly: true},
 				// As `/` is binded, the cwd is picked as the container CWD.
 				Process: &specs.Process{Cwd: cwd},
+				// The root bind hides the earlier mount at /dst1, and the tmpfs
+				// at /tmp hides the default one.
 				Mounts: appendMounts(
-					defaultMounts,
-					[]specs.Mount{{
-						Type:        "bind",
-						Source:      "/src1",
-						Destination: "/dst1",
-					}},
+					defaultMounts[:len(defaultMounts)-1],
 					[]specs.Mount{{
 						Type:        "bind",
 						Source:      "/",
@@ -163,6 +160,259 @@ func TestSandboxOptions(t *testing.T) {
 					UIDMappings: wantIDMappings(1234, sudoUID),
 					GIDMappings: wantIDMappings(5678, sudoGID),
 				},
+			},
+		},
+		{
+			name: "ReadOnlyTmpfsRoot",
+			cfg: &bwrapConfig{
+				Env:               os.Environ(),
+				UID:               -1,
+				GID:               -1,
+				Args:              []string{"ls"},
+				TmpfsRootReadOnly: true,
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "rootfs"},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: appendMounts(
+					[]specs.Mount{{Type: "tmpfs", Destination: "/", Options: []string{"ro"}}},
+					defaultMounts,
+				),
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			// A root bind replaces the tmpfs root, so TmpfsRootReadOnly does
+			// not apply.
+			name: "ReadOnlyTmpfsRootWithRootBind",
+			cfg: &bwrapConfig{
+				Env:               os.Environ(),
+				UID:               -1,
+				GID:               -1,
+				Mounts:            []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: "/", Destination: "/"}},
+				Args:              []string{"ls"},
+				TmpfsRootReadOnly: true,
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "/"},
+				Process: &specs.Process{Cwd: cwd},
+				Mounts: appendMounts(
+					defaultMounts,
+					[]specs.Mount{{Type: "bind", Source: "/", Destination: "/"}},
+				),
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			// Mounts stack in command-line order, so the last mount at "/"
+			// is the root.
+			name: "LastRootMount",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeBind, Source: "/src1", Destination: "/"},
+					{Type: sandbox.MountTypeBind, Source: "/src2", Destination: "/", ReadOnly: true},
+				},
+				Args: []string{"ls"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "/src2", Readonly: true},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: appendMounts(
+					defaultMounts,
+					[]specs.Mount{{Type: "bind", Source: "/src2", Destination: "/", Options: []string{"ro"}}},
+				),
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			// A tmpfs at "/" after the root bind replaces it as the root.
+			name: "RootBindThenTmpfs",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeBind, Source: "/src1", Destination: "/"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/"},
+				},
+				Args: []string{"ls"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "rootfs"},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: appendMounts(
+					[]specs.Mount{{Type: "tmpfs", Destination: "/"}},
+					defaultMounts,
+				),
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			// A later mount at or above DEST hides a mount, so it is left
+			// out. A mount on the command line hides the default mounts it
+			// covers.
+			name: "HiddenMounts",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeBind, Source: "/src1", Destination: "/mnt/sub"},
+					{Type: sandbox.MountTypeBind, Source: "/src2", Destination: "/opt"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt", ReadOnly: true},
+					{Type: sandbox.MountTypeBind, Source: "/src3", Destination: "/opt", ReadOnly: true},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/sys"},
+				},
+				Args: []string{"ls"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "rootfs"},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: []specs.Mount{
+					{Type: "tmpfs", Destination: "/"},
+					{Type: "proc", Destination: "/proc"},
+					{Type: "devtmpfs", Destination: "/dev"},
+					{Type: "devpts", Destination: "/dev/pts"},
+					{Type: "tmpfs", Destination: "/tmp"},
+					{Type: "tmpfs", Destination: "/mnt", Options: []string{"ro"}},
+					{Type: "bind", Source: "/src3", Destination: "/opt", Options: []string{"ro"}},
+					{Type: "tmpfs", Destination: "/sys"},
+				},
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			// A --dir stands for a directory, so the later root bind hides
+			// it.
+			name: "HiddenDirStandIn",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/foo"},
+					{Type: sandbox.MountTypeBind, Source: "/src1", Destination: "/", ReadOnly: true},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/bar"},
+				},
+				dirMounts: map[int]bool{0: true, 2: true},
+				Args:      []string{"ls"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "/src1", Readonly: true},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: appendMounts(
+					defaultMounts,
+					[]specs.Mount{
+						{Type: "bind", Source: "/src1", Destination: "/", Options: []string{"ro"}},
+						{Type: "tmpfs", Destination: "/bar"},
+					},
+				),
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			// The root bind hides the earlier tmpfs at /tmp, which then
+			// does not hide the default /tmp.
+			name: "HiddenMountDoesNotHideDefault",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/tmp"},
+					{Type: sandbox.MountTypeBind, Source: "/src1", Destination: "/", ReadOnly: true},
+				},
+				Args: []string{"ls"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "/src1", Readonly: true},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: appendMounts(
+					defaultMounts,
+					[]specs.Mount{{Type: "bind", Source: "/src1", Destination: "/", Options: []string{"ro"}}},
+				),
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			// runsc adds a devpts at /dev/pts when the specification has
+			// none, so the default stays, read-only like the tmpfs over it.
+			name: "DevPtsUnderReadOnlyTmpfs",
+			cfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/dev", ReadOnly: true}},
+				Args:   []string{"ls"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "rootfs"},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: []specs.Mount{
+					{Type: "tmpfs", Destination: "/"},
+					{Type: "proc", Destination: "/proc"},
+					{Type: "sysfs", Destination: "/sys"},
+					{Type: "devpts", Destination: "/dev/pts", Options: []string{"ro"}},
+					{Type: "cgroupfs", Destination: "/sys/fs/cgroup"},
+					{Type: "tmpfs", Destination: "/tmp"},
+					{Type: "tmpfs", Destination: "/dev", Options: []string{"ro"}},
+				},
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			// A devpts on the command line replaces the default one.
+			name: "DevPtsFromCommandLine",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeDevtmpfs, Destination: "/dev"},
+					{Type: sandbox.MountTypeDevpts, Destination: "/dev/pts"},
+				},
+				Args: []string{"ls"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "rootfs"},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: []specs.Mount{
+					{Type: "tmpfs", Destination: "/"},
+					{Type: "proc", Destination: "/proc"},
+					{Type: "sysfs", Destination: "/sys"},
+					{Type: "cgroupfs", Destination: "/sys/fs/cgroup"},
+					{Type: "tmpfs", Destination: "/tmp"},
+					{Type: "devtmpfs", Destination: "/dev"},
+					{Type: "devpts", Destination: "/dev/pts"},
+				},
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			name: "ReadOnlyDefaults",
+			cfg: &bwrapConfig{
+				Env:              os.Environ(),
+				UID:              -1,
+				GID:              -1,
+				Args:             []string{"ls"},
+				ReadOnlyDefaults: []string{"/dev", "/tmp"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "rootfs"},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: []specs.Mount{
+					{Type: "tmpfs", Destination: "/"},
+					{Type: "proc", Destination: "/proc"},
+					{Type: "sysfs", Destination: "/sys"},
+					{Type: "devtmpfs", Destination: "/dev", Options: []string{"ro"}},
+					{Type: "devpts", Destination: "/dev/pts"},
+					{Type: "cgroupfs", Destination: "/sys/fs/cgroup"},
+					{Type: "tmpfs", Destination: "/tmp", Options: []string{"ro"}},
+				},
+				Linux: &specs.Linux{},
 			},
 		},
 		{
@@ -833,12 +1083,12 @@ func TestParseFlags(t *testing.T) {
 		},
 		{
 			name: "DirOnProc",
-			args: []string{"--proc", "/proc", "--dir", "/proc", "bash"},
+			args: []string{"--proc", "/proc1", "--dir", "/proc1", "bash"},
 			wantCfg: &bwrapConfig{
 				Env:    os.Environ(),
 				UID:    -1,
 				GID:    -1,
-				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeProc, Destination: "/proc"}},
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeProc, Destination: "/proc1"}},
 				Args:   []string{"bash"},
 			},
 		},
@@ -919,6 +1169,470 @@ func TestParseFlags(t *testing.T) {
 			name:        "PermsWithoutOperation",
 			args:        []string{"--perms", "0700", "--ro-bind", "/", "/", "--", "bash"},
 			errContains: "--perms must be followed by",
+		},
+		{
+			name: "RemountROBind",
+			args: []string{"--bind", mntSrc, "/mnt", "--remount-ro", "/mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt", ReadOnly: true}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			name: "RemountROTmpfs",
+			args: []string{"--tmpfs", "/mnt", "--remount-ro", "/mnt/", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/mnt", ReadOnly: true}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			// Only the topmost mount at DEST, as of --remount-ro, becomes
+			// read-only. Mounts below DEST and mounts declared later keep
+			// their mode.
+			name: "RemountROTopmostMountOnly",
+			args: []string{
+				"--bind", mntSrc, "/mnt",
+				"--tmpfs", "/mnt",
+				"--tmpfs", "/mnt/sub",
+				"--remount-ro", "/mnt",
+				"--tmpfs", "/mnt",
+				"bash",
+			},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt", ReadOnly: true},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/sub"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name: "RemountROBindRoot",
+			args: []string{"--bind", "/", "/", "--remount-ro", "/", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{rootBind},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			name: "RemountROTmpfsRoot",
+			args: []string{"--remount-ro", "/", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:               os.Environ(),
+				UID:               -1,
+				GID:               -1,
+				TmpfsRootReadOnly: true,
+				Args:              []string{"bash"},
+			},
+		},
+		{
+			name:        "RemountRONotMountPoint",
+			args:        []string{"--tmpfs", "/mnt", "--remount-ro", "/mnt/sub", "bash"},
+			errContains: "Can't remount readonly on /mnt/sub",
+		},
+		{
+			name:        "MissingRemountROArg",
+			args:        []string{"--remount-ro"},
+			errContains: "--remount-ro takes 1 argument",
+		},
+		{
+			// --remount-ro keeps the mode that --perms set.
+			name: "RemountROPerms",
+			args: []string{"--perms", "0777", "--tmpfs", "/mnt", "--remount-ro", "/mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/mnt", Mode: permsPtr(0777), ReadOnly: true}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			// A relative DEST is taken from the root.
+			name: "RemountRORelativeDest",
+			args: []string{"--tmpfs", "/mnt", "--remount-ro", "mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/mnt", ReadOnly: true}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			// --dev /dev reuses the default /dev mount, which --remount-ro
+			// then finds.
+			name: "RemountRODev",
+			args: []string{"--dev", "/dev", "--remount-ro", "/dev", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:              os.Environ(),
+				UID:              -1,
+				GID:              -1,
+				ReadOnlyDefaults: []string{"/dev"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			name: "RemountRODefaultMount",
+			args: []string{"--remount-ro", "/tmp", "--remount-ro", "/tmp/", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:              os.Environ(),
+				UID:              -1,
+				GID:              -1,
+				ReadOnlyDefaults: []string{"/tmp"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			// --proc /proc reuses the default /proc mount.
+			name: "RemountROProc",
+			args: []string{"--proc", "/proc", "--remount-ro", "/proc", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:              os.Environ(),
+				UID:              -1,
+				GID:              -1,
+				ReadOnlyDefaults: []string{"/proc"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			// The later tmpfs at /mnt hides the tmpfs at /mnt/sub.
+			name:        "RemountROHiddenMount",
+			args:        []string{"--tmpfs", "/mnt/sub", "--tmpfs", "/mnt", "--remount-ro", "/mnt/sub", "bash"},
+			errContains: "Can't remount readonly on /mnt/sub",
+		},
+		{
+			// A --dir stand-in is a directory in the remounted filesystem, so
+			// it becomes read-only with it.
+			name: "RemountRODirStandIn",
+			args: []string{"--tmpfs", "/mnt", "--dir", "/mnt/foo", "--dir", "/mnt/foo/bar", "--remount-ro", "/mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt", ReadOnly: true},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/foo", ReadOnly: true},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/foo/bar", ReadOnly: true},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			// Only the stand-ins in the remounted filesystem change.
+			name: "RemountRODirStandInOtherMount",
+			args: []string{"--tmpfs", "/mnt", "--tmpfs", "/mnt/sub", "--dir", "/mnt/sub/foo", "--remount-ro", "/mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt", ReadOnly: true},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/sub"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/sub/foo"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name: "RemountRODirUnderDefaultMount",
+			args: []string{"--dir", "/tmp/foo", "--remount-ro", "/tmp", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:              os.Environ(),
+				UID:              -1,
+				GID:              -1,
+				Mounts:           []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/tmp/foo", ReadOnly: true}},
+				ReadOnlyDefaults: []string{"/tmp"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			name: "RemountROTmpfsRootDir",
+			args: []string{"--dir", "/foo", "--remount-ro", "/", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:               os.Environ(),
+				UID:               -1,
+				GID:               -1,
+				Mounts:            []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/foo", ReadOnly: true}},
+				TmpfsRootReadOnly: true,
+				Args:              []string{"bash"},
+			},
+		},
+		{
+			// A tmpfs at "/" holds the paths below it.
+			name:        "DirAfterRemountROTmpfsAtRoot",
+			args:        []string{"--tmpfs", "/", "--remount-ro", "/", "--dir", "/foo", "bash"},
+			errContains: "Can't mkdir /foo: read-only file system",
+		},
+		{
+			name: "RemountROTmpfsAtRootDir",
+			args: []string{"--tmpfs", "/", "--dir", "/foo", "--remount-ro", "/", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/", ReadOnly: true},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/foo", ReadOnly: true},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			// A later --tmpfs hides the first --dir, so the second one
+			// creates the directory again.
+			name: "DirHiddenThenAgain",
+			args: []string{"--dir", "/mnt/foo", "--tmpfs", "/mnt", "--dir", "/mnt/foo", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/foo"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/foo"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name:        "DirHiddenThenAgainReadOnly",
+			args:        []string{"--dir", "/mnt/foo", "--tmpfs", "/mnt", "--remount-ro", "/mnt", "--dir", "/mnt/foo", "bash"},
+			errContains: "Can't mkdir /mnt/foo: read-only file system",
+		},
+		{
+			// The root bind hides the earlier tmpfs at /tmp, so the default
+			// /tmp is the mount there.
+			name: "RemountRODefaultUnderHiddenMount",
+			args: []string{"--tmpfs", "/tmp", "--ro-bind", "/", "/", "--remount-ro", "/tmp", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/tmp"},
+					rootBind,
+				},
+				ReadOnlyDefaults: []string{"/tmp"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			// The root bind hides the earlier tmpfs at /mnt.
+			name:        "RemountROHiddenByRootBind",
+			args:        []string{"--tmpfs", "/mnt", "--ro-bind", "/", "/", "--remount-ro", "/mnt", "bash"},
+			errContains: "Can't remount readonly on /mnt",
+		},
+		{
+			// A --dir stands for a directory, not a mount point.
+			name:        "RemountRODir",
+			args:        []string{"--dir", "/foo", "--remount-ro", "/foo", "bash"},
+			errContains: "Can't remount readonly on /foo",
+		},
+		{
+			name:        "DirAfterRemountRO",
+			args:        []string{"--tmpfs", "/mnt", "--remount-ro", "/mnt", "--dir", "/mnt/new", "bash"},
+			errContains: "Can't mkdir /mnt/new: read-only file system",
+		},
+		{
+			name:        "DirAfterRemountROTmpfsRoot",
+			args:        []string{"--remount-ro", "/", "--dir", "/new", "bash"},
+			errContains: "Can't mkdir /new: read-only file system",
+		},
+		{
+			// An existing DEST needs no mkdir.
+			name: "DirAfterRemountROExisting",
+			args: []string{"--tmpfs", "/mnt", "--tmpfs", "/mnt/sub", "--remount-ro", "/mnt", "--dir", "/mnt/sub", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt", ReadOnly: true},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/sub"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			// DEST exists, so --dir needs no mkdir in the read-only
+			// filesystem.
+			name: "DirAfterRemountRODefaultMount",
+			args: []string{"--remount-ro", "/tmp", "--dir", "/tmp", "--remount-ro", "/sys", "--dir", "/sys/fs", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:              os.Environ(),
+				UID:              -1,
+				GID:              -1,
+				ReadOnlyDefaults: []string{"/tmp", "/sys"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			// runsc does not know what the dev filesystem holds, so the
+			// stand-in is a read-only directory.
+			name: "DirAfterRemountRODev",
+			args: []string{"--dev", "/dev", "--remount-ro", "/dev", "--dir", "/dev/shm", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:              os.Environ(),
+				UID:              -1,
+				GID:              -1,
+				Mounts:           []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/dev/shm", ReadOnly: true}},
+				ReadOnlyDefaults: []string{"/dev"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			// /dev/pts, not /dev, holds /dev/pts/foo.
+			name: "RemountRONestedDefaultMounts",
+			args: []string{"--dir", "/dev/pts/foo", "--remount-ro", "/dev", "--dir", "/dev/pts/bar", "--remount-ro", "/sys/fs/cgroup", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/dev/pts/foo"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/dev/pts/bar"},
+				},
+				ReadOnlyDefaults: []string{"/dev", "/sys/fs/cgroup"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			// The default mounts go on top of the root bind.
+			name: "RemountRODefaultMountUnderRootBind",
+			args: []string{"--ro-bind", "/", "/", "--remount-ro", "/dev/pts", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:              os.Environ(),
+				UID:              -1,
+				GID:              -1,
+				Mounts:           []sandbox.Mount{rootBind},
+				ReadOnlyDefaults: []string{"/dev/pts"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			// The tmpfs at /sys hides the default mount at /sys/fs/cgroup.
+			name:        "RemountROHiddenDefaultMount",
+			args:        []string{"--tmpfs", "/sys", "--remount-ro", "/sys/fs/cgroup", "bash"},
+			errContains: "Can't remount readonly on /sys/fs/cgroup",
+		},
+		{
+			// A --dev or --proc after --remount-ro mounts a new writable
+			// filesystem on top.
+			name: "DevAndProcAfterRemountRO",
+			args: []string{"--remount-ro", "/dev", "--dev", "/dev", "--proc", "/proc", "--remount-ro", "/proc", "--proc", "/proc", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeDevtmpfs, Destination: "/dev"},
+					{Type: sandbox.MountTypeDevpts, Destination: "/dev/pts"},
+					{Type: sandbox.MountTypeProc, Destination: "/proc"},
+				},
+				ReadOnlyDefaults: []string{"/dev", "/proc"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			// --dev also mounts a new devpts, so a read-only DEST/pts makes
+			// it mount a new dev filesystem.
+			name: "DevAfterRemountROPts",
+			args: []string{"--remount-ro", "/dev/pts", "--dev", "/dev", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeDevtmpfs, Destination: "/dev"},
+					{Type: sandbox.MountTypeDevpts, Destination: "/dev/pts"},
+				},
+				ReadOnlyDefaults: []string{"/dev/pts"},
+				Args:             []string{"bash"},
+			},
+		},
+		{
+			// A --dev or --proc whose earlier mount is hidden mounts a new
+			// filesystem on top.
+			name: "DevAndProcOverOtherMounts",
+			args: []string{"--tmpfs", "/dev", "--dev", "/dev", "--proc", "/p", "--tmpfs", "/p", "--proc", "/p", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/dev"},
+					{Type: sandbox.MountTypeDevtmpfs, Destination: "/dev"},
+					{Type: sandbox.MountTypeDevpts, Destination: "/dev/pts"},
+					{Type: sandbox.MountTypeProc, Destination: "/p"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/p"},
+					{Type: sandbox.MountTypeProc, Destination: "/p"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			// A default mount over the root bind holds DEST, so --dir does
+			// not use the host path behind the bind.
+			name: "DirInDefaultMountOverRootBind",
+			args: []string{"--bind", mntSrc, "/", "--dir", "/tmp/foo", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/tmp/foo"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name:        "DirInReadOnlyDefaultMountOverRootBind",
+			args:        []string{"--bind", mntSrc, "/", "--remount-ro", "/tmp", "--dir", "/tmp/foo", "bash"},
+			errContains: "Can't mkdir /tmp/foo: read-only file system",
+		},
+		{
+			// A --dir under a bind is made on the host when the sandbox is
+			// set up, but it sees the bind as of its place on the command
+			// line.
+			name: "HostDirBeforeRemountRO",
+			args: []string{"--bind", mntSrc, "/mnt", "--dir", "/mnt/new", "--remount-ro", "/mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt", ReadOnly: true}},
+				HostDirs: []HostDir{{Dest: "/mnt/new", Path: mntSrc + "/new", Perms: 0755}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			name: "HostDirAfterRemountRO",
+			args: []string{"--bind", mntSrc, "/mnt", "--remount-ro", "/mnt", "--dir", "/mnt/new", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt", ReadOnly: true}},
+				HostDirs: []HostDir{{Dest: "/mnt/new", Path: mntSrc + "/new", ReadOnly: true, Perms: 0755}},
+				Args:     []string{"bash"},
+			},
 		},
 	}
 

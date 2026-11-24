@@ -25,6 +25,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -94,6 +95,16 @@ type bwrapConfig struct {
 	AsPID1      bool
 	hasArgv0    bool
 	nextPerms   *uint32
+
+	// TmpfsRootReadOnly makes the tmpfs root read-only. It applies only
+	// when no bind mount has "/" as its destination.
+	TmpfsRootReadOnly bool
+	// ReadOnlyDefaults holds the destinations of the default mounts that
+	// --remount-ro makes read-only.
+	ReadOnlyDefaults []string
+	// dirMounts holds the indexes in Mounts of the tmpfs mounts that stand
+	// in for --dir directories.
+	dirMounts map[int]bool
 }
 
 // String returns a string representation of the bwrapConfig.
@@ -145,14 +156,152 @@ func (c *bwrapConfig) newMount(src, dst string, mountType sandbox.MountType, rea
 	return m, nil
 }
 
-// getRootMount returns the root mount if it exists.
-func (c *bwrapConfig) getRootMount() (sandbox.Mount, bool) {
-	for _, m := range c.Mounts {
-		if m.Destination == "/" {
-			return m, true
+// rootIndex returns the index in Mounts of the last mount at "/", which hides
+// the earlier ones, or -1 if there is none.
+func (c *bwrapConfig) rootIndex() int {
+	for i := len(c.Mounts) - 1; i >= 0; i-- {
+		if c.Mounts[i].Destination == "/" {
+			return i
 		}
 	}
-	return sandbox.Mount{}, false
+	return -1
+}
+
+// covers reports whether path is mountPoint or below it.
+func covers(mountPoint, path string) bool {
+	rel, err := filepath.Rel(mountPoint, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+// mountHolder identifies the filesystem that holds a sandbox path: the mount
+// at index in Mounts, or, when index is -1, the default mount at dflt, or the
+// root when dflt is empty.
+type mountHolder struct {
+	index int
+	dflt  string
+}
+
+// holder returns the filesystem that holds path, as of the mounts declared
+// before Mounts[before]. That is the last of those mounts that covers path,
+// skipping --dir stand-ins, which stand for directories, mounts that a later
+// one of those mounts hides, and mounts at "/". Without one, it is the deepest default mount that covers path. Without
+// one either, it is the root: the last mount at "/", or else the tmpfs root.
+func (c *bwrapConfig) holder(path string, before int) mountHolder {
+	root := mountHolder{index: -1}
+	for j := before - 1; j >= 0; j-- {
+		m := c.Mounts[j]
+		if c.dirMounts[j] || !covers(m.Destination, path) || c.hiddenBefore(j, before) {
+			continue
+		}
+		if m.Destination != "/" {
+			return mountHolder{index: j}
+		}
+		// The default mounts go on top of the root.
+		if root.index < 0 {
+			root.index = j
+		}
+	}
+	h := mountHolder{index: -1}
+	for _, m := range defaultMounts() {
+		if covers(m.Destination, path) && len(m.Destination) > len(h.dflt) {
+			h.dflt = m.Destination
+		}
+	}
+	if h.dflt != "" {
+		return h
+	}
+	return root
+}
+
+// mountAt returns the topmost mount at path, skipping --dir stand-ins. ok is
+// false when path is not a mount point. A mount that a later mount hides does
+// not count.
+func (c *bwrapConfig) mountAt(path string) (h mountHolder, ok bool) {
+	for j := len(c.Mounts) - 1; j >= 0; j-- {
+		if !c.dirMounts[j] && c.Mounts[j].Destination == path && !c.hidden(j) {
+			return mountHolder{index: j}, true
+		}
+	}
+	if h := c.holder(path, len(c.Mounts)); h.index < 0 && h.dflt == path {
+		return h, true
+	}
+	return mountHolder{index: -1}, path == "/"
+}
+
+// hidden reports whether a mount declared after Mounts[j], other than a --dir
+// stand-in, covers the destination of Mounts[j], so that Mounts[j] cannot be
+// reached in the sandbox.
+func (c *bwrapConfig) hidden(j int) bool {
+	return c.hiddenBefore(j, len(c.Mounts))
+}
+
+// hiddenBefore is hidden, as of the mounts declared before Mounts[end].
+func (c *bwrapConfig) hiddenBefore(j, end int) bool {
+	for k := j + 1; k < end; k++ {
+		if !c.dirMounts[k] && covers(c.Mounts[k].Destination, c.Mounts[j].Destination) {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultHidden reports whether a mount declared on the command line covers
+// the default mount at dest. --dir stand-ins, mounts at "/" and mounts that a
+// later mount hides do not count. The default mounts go on top of the root.
+func (c *bwrapConfig) defaultHidden(dest string) bool {
+	for k, m := range c.Mounts {
+		if !c.dirMounts[k] && m.Destination != "/" && covers(m.Destination, dest) && !c.hidden(k) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMountAt reports whether a mount declared on the command line, other than
+// a --dir stand-in or a hidden mount, is at path.
+func (c *bwrapConfig) hasMountAt(path string) bool {
+	for j, m := range c.Mounts {
+		if !c.dirMounts[j] && m.Destination == path && !c.hidden(j) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDefaultMountAtOrBelow reports whether a default mount that no mount on
+// the command line hides is at path or below it, so that path is a directory.
+func (c *bwrapConfig) hasDefaultMountAtOrBelow(path string) bool {
+	for _, m := range defaultMounts() {
+		if covers(path, m.Destination) && !c.defaultHidden(m.Destination) {
+			return true
+		}
+	}
+	return false
+}
+
+// holderType returns the mount type of the filesystem h.
+func (c *bwrapConfig) holderType(h mountHolder) sandbox.MountType {
+	if h.index >= 0 {
+		return c.Mounts[h.index].Type
+	}
+	for _, m := range defaultMounts() {
+		if m.Destination == h.dflt {
+			return m.Type
+		}
+	}
+	return sandbox.MountTypeTmpfs
+}
+
+// readOnly reports whether the filesystem h is read-only.
+func (c *bwrapConfig) readOnly(h mountHolder) bool {
+	switch {
+	case h.index >= 0:
+		return c.Mounts[h.index].ReadOnly
+	case h.dflt != "":
+		return slices.Contains(c.ReadOnlyDefaults, h.dflt)
+	default:
+		return c.TmpfsRootReadOnly
+	}
 }
 
 // subDirPath returns the absolute path of a child path
@@ -240,9 +389,9 @@ func (c *bwrapConfig) hasMountAtOrBelow(path string) bool {
 	if path == "/" {
 		return true
 	}
-	for _, m := range c.Mounts {
+	for j, m := range c.Mounts {
 		rel, err := filepath.Rel(path, m.Destination)
-		if err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, "../") && !c.hidden(j) {
 			return true
 		}
 	}
@@ -329,13 +478,37 @@ func (c *bwrapConfig) prepareSandbox() ([]sandbox.Option, error) {
 	}
 
 	var mounts []sandbox.Mount
-	if rootMount, ok := c.getRootMount(); ok {
-		opts = append(opts, sandbox.WithRootfs(rootMount.Source, rootMount.ReadOnly))
-	} else {
-		mounts = append(mounts, sandbox.Mount{Destination: "/", Type: sandbox.MountTypeTmpfs})
+	root := c.rootIndex()
+	switch {
+	case root >= 0 && c.Mounts[root].Type == sandbox.MountTypeBind:
+		opts = append(opts, sandbox.WithRootfs(c.Mounts[root].Source, c.Mounts[root].ReadOnly))
+	case root >= 0:
+		// A mount of another type at "/" replaces the tmpfs root.
+		mounts = append(mounts, c.Mounts[root])
+	default:
+		mounts = append(mounts, sandbox.Mount{Destination: "/", Type: sandbox.MountTypeTmpfs, ReadOnly: c.TmpfsRootReadOnly})
 	}
-	mounts = append(mounts, defaultMounts()...)
-	mounts = append(mounts, c.Mounts...)
+	for _, m := range defaultMounts() {
+		m.ReadOnly = slices.Contains(c.ReadOnlyDefaults, m.Destination)
+		if c.defaultHidden(m.Destination) {
+			// runsc mounts a devpts at /dev/pts whenever the specification
+			// has none. Unless a mount on the command line puts one there,
+			// keep the default, read-only when the mount that hides it is.
+			if m.Destination != "/dev/pts" || c.hasMountAt(m.Destination) {
+				continue
+			}
+			m.ReadOnly = c.readOnly(c.holder(m.Destination, len(c.Mounts)))
+		}
+		mounts = append(mounts, m)
+	}
+	// Leave out the mounts that a later mount hides, so that they cannot end
+	// up on top of it, whatever order runsc mounts them in.
+	for j, m := range c.Mounts {
+		if c.hidden(j) || (j == root && m.Type != sandbox.MountTypeBind) {
+			continue
+		}
+		mounts = append(mounts, m)
+	}
 	opts = append(opts, sandbox.WithMount(mounts...))
 
 	var namespaces []specs.LinuxNamespace

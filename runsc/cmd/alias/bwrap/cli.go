@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -62,6 +63,7 @@ const (
 	flagDir           = "dir"
 	flagAsPID1        = "as-pid-1"
 	flagDev           = "dev"
+	flagRemountRO     = "remount-ro"
 )
 
 // Cli implements subcommands.Command for the "bwrap" command.
@@ -94,6 +96,7 @@ type Cli struct {
 	dir           string
 	asPID1        bool
 	dev           string
+	remountRO     string
 }
 
 // Name implements subcommands.Command.Name.
@@ -140,6 +143,7 @@ func (c *Cli) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.dir, flagDir, "", "Create dir at DEST")
 	f.BoolVar(&c.asPID1, flagAsPID1, false, "Do not install a reaper process with PID=1")
 	f.StringVar(&c.dev, flagDev, "", "Mount new dev on DEST")
+	f.StringVar(&c.remountRO, flagRemountRO, "", "Remount DEST as readonly; does not recursively remount")
 
 	// Override the default usage function to print the custom usage message.
 	f.Usage = func() {
@@ -237,6 +241,8 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 			i, err = cfg.parseAsPID1(bwrapArgs, i)
 		case flagDev:
 			i, err = cfg.parseDev(bwrapArgs, i)
+		case flagRemountRO:
+			i, err = cfg.parseRemountRO(bwrapArgs, i)
 		default:
 			return nil, fmt.Errorf("bwrap: Unknown option: %s", arg)
 		}
@@ -335,7 +341,9 @@ func (c *bwrapConfig) parseDir(args []string, i int) (int, error) {
 	}
 	dst := args[i+1]
 	perms := c.takePerms()
-	if bind, hostPath, ok := c.hostPath(dst); ok {
+	holder := c.holder(dst, len(c.Mounts))
+	// A default mount over a root bind hides the host path behind the bind.
+	if bind, hostPath, ok := c.hostPath(dst); ok && holder.dflt == "" {
 		dir := HostDir{Dest: dst, Path: hostPath, ReadOnly: bind.ReadOnly, Perms: defaultDirPerms}
 		if perms != nil {
 			dir.Perms = *perms
@@ -343,14 +351,27 @@ func (c *bwrapConfig) parseDir(args []string, i int) (int, error) {
 		c.HostDirs = append(c.HostDirs, dir)
 		return i + 2, nil
 	}
-	if c.hasMountAtOrBelow(dst) {
+	if c.hasMountAtOrBelow(dst) || c.hasDefaultMountAtOrBelow(dst) {
 		return i + 2, nil
+	}
+	// In a read-only filesystem, mkdir fails unless DEST exists. A tmpfs
+	// holds only the mount points and directories declared on the command
+	// line, so DEST is missing there. Other filesystems have contents that
+	// runsc does not know, so the stand-in is a read-only directory.
+	readOnly := c.readOnly(holder)
+	if readOnly && c.holderType(holder) == sandbox.MountTypeTmpfs {
+		return i, fmt.Errorf("bwrap: Can't mkdir %s: %v", dst, unix.EROFS)
 	}
 	mnt, err := c.newMount("", dst, sandbox.MountTypeTmpfs, false /* readOnly */)
 	if err != nil {
 		return i, err
 	}
 	mnt.Mode = perms
+	mnt.ReadOnly = readOnly
+	if c.dirMounts == nil {
+		c.dirMounts = make(map[int]bool)
+	}
+	c.dirMounts[len(c.Mounts)] = true
 	c.Mounts = append(c.Mounts, mnt)
 	return i + 2, nil
 }
@@ -442,10 +463,10 @@ func (c *bwrapConfig) parseProc(args []string, i int) (int, error) {
 	}
 
 	dst := filepath.Clean(args[i+1])
-	for _, m := range c.Mounts {
-		if m.Type == sandbox.MountTypeProc && m.Destination == dst {
-			return i + 2, nil
-		}
+	// A writable procfs already at DEST serves as the new one. After
+	// --remount-ro, a new writable procfs goes on top.
+	if h, ok := c.mountAt(dst); ok && c.holderType(h) == sandbox.MountTypeProc && !c.readOnly(h) {
+		return i + 2, nil
 	}
 	mnt, err := c.newMount("", dst, sandbox.MountTypeProc, false /* readOnly */)
 	if err != nil {
@@ -465,10 +486,14 @@ func (c *bwrapConfig) parseDev(args []string, i int) (int, error) {
 	}
 
 	dst := filepath.Clean(args[i+1])
-	for _, m := range append(defaultMounts(), c.Mounts...) {
-		if m.Type == sandbox.MountTypeDevtmpfs && m.Destination == dst {
-			return i + 2, nil
-		}
+	// A writable dev filesystem already at DEST, with a writable devpts at
+	// DEST/pts, serves as the new one. After --remount-ro, a new writable one
+	// goes on top.
+	devH, devOK := c.mountAt(dst)
+	ptsH, ptsOK := c.mountAt(filepath.Join(dst, "pts"))
+	if devOK && c.holderType(devH) == sandbox.MountTypeDevtmpfs && !c.readOnly(devH) &&
+		ptsOK && c.holderType(ptsH) == sandbox.MountTypeDevpts && !c.readOnly(ptsH) {
+		return i + 2, nil
 	}
 	dev, err := c.newMount("", dst, sandbox.MountTypeDevtmpfs, false /* readOnly */)
 	if err != nil {
@@ -480,6 +505,40 @@ func (c *bwrapConfig) parseDev(args []string, i int) (int, error) {
 	}
 	c.Mounts = append(c.Mounts, dev, pts)
 
+	return i + 2, nil
+}
+
+// parseRemountRO handles --remount-ro DEST. It makes the
+// topmost mount at DEST, among those declared before it, read-only. Mounts
+// declared after it and mounts below DEST keep their mode. DEST must be a
+// mount point: the root, a default mount, or the destination of an earlier
+// mount other than a --dir. A relative DEST is taken from the root.
+func (c *bwrapConfig) parseRemountRO(args []string, i int) (int, error) {
+	if i+1 >= len(args) {
+		return i, fmt.Errorf("bwrap: --%s takes 1 argument", flagRemountRO)
+	}
+	dst := filepath.Clean("/" + args[i+1])
+	target, ok := c.mountAt(dst)
+	if !ok {
+		return i, fmt.Errorf("bwrap: Can't remount readonly on %s: Unable to find %q in mount table", args[i+1], dst)
+	}
+	switch {
+	case target.index >= 0:
+		c.Mounts[target.index].ReadOnly = true
+	case target.dflt != "":
+		if !slices.Contains(c.ReadOnlyDefaults, target.dflt) {
+			c.ReadOnlyDefaults = append(c.ReadOnlyDefaults, target.dflt)
+		}
+	default:
+		c.TmpfsRootReadOnly = true
+	}
+	// A --dir in the remounted filesystem stands for a directory in it, so
+	// it becomes read-only too.
+	for k := range c.dirMounts {
+		if c.holder(c.Mounts[k].Destination, k) == target {
+			c.Mounts[k].ReadOnly = true
+		}
+	}
 	return i + 2, nil
 }
 

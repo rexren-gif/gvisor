@@ -43,6 +43,8 @@ line unchanged.
 | :--- | :--- | :--- | :--- |
 | `--bind` | `<SRC> <DEST>` | Bind mounts `SRC` to `DEST`. When `SRC` is the host root (`/`) and `DEST` is not, the mount also gets `rbind, rprivate, nosuid, nodev`. | — |
 | `--ro-bind` | `<SRC> <DEST>` | Read-only bind mounts `SRC` to `DEST`. Sets `spec.Root.Readonly = true` if `DEST` is `/`. | — |
+| `--bind-try` | `<SRC> <DEST>` | Same as `--bind`, but skips the mount when `SRC` does not exist. | `SRC` must exist when `runsc` reads the command line, or come from an earlier `--dir`. A mount point that an earlier mount creates on the host does not count, nor does a `--dir` for a `SRC` with a `..` component. An empty `SRC` fails. |
+| `--ro-bind-try` | `<SRC> <DEST>` | Same as `--ro-bind`, but skips the mount when `SRC` does not exist. | Same as `--bind-try`. |
 | `--tmpfs` | `<DEST>` | Mounts a fresh `tmpfs` filesystem at `DEST`. | — |
 | `--dir` | `<DEST>` | Creates a directory at `DEST`, like `bwrap`: an existing `DEST` is left as it is, and a missing one is created with its parents. Under a `--bind` the directory is created on the host and outlives the sandbox; under a `--ro-bind` a missing `DEST` fails with `Can't mkdir`. | Where no bind mount backs `DEST` (for example under a `--tmpfs`), the directory is a fresh `tmpfs` mount rather than a plain directory. |
 | `--perms` | `<OCTAL>` | Sets the mode of the mount created by the next `--tmpfs` or `--dir`. Must come right before that flag, takes an octal value up to `07777`, and may appear once per action. | Without it, the mount keeps the `tmpfs` default of `01777`, where `bwrap` uses `0755`. `--file`, `--bind-data`, and `--ro-bind-data` are not supported yet. |
@@ -56,14 +58,16 @@ line unchanged.
 > nosuid, nodev` options above do not apply to `--bind / /`.
 
 > **NOTE:** `SRC` must exist on the host. A missing source aborts the run with
-> `Can't find source path` before the sandbox starts.
+> `Can't find source path` before the sandbox starts. `--bind-try` and
+> `--ro-bind-try` skip the mount instead, unless an earlier `--dir` under a
+> writable `--bind` creates `SRC`.
 
 > **NOTE:** Every sandbox gets `/proc`, `/sys`, `/dev`, `/dev/pts`,
 > `/sys/fs/cgroup`, and `/tmp`, all backed by gVisor's own implementations of
 > those filesystems. These defaults are applied first and the command line is
 > layered on top of them, so a mount you ask for at one of those paths wins. If
-> no root mount (`/`) is specified via `--bind` or `--ro-bind`, gVisor
-> initializes a fresh `tmpfs` root filesystem at `/`.
+> no bind mount flag sets the root (`/`), gVisor initializes a fresh `tmpfs`
+> root filesystem at `/`.
 
 ### Namespace & Isolation Controls
 

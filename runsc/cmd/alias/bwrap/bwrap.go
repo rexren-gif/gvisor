@@ -21,10 +21,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -119,20 +121,27 @@ func defaultMounts() []sandbox.Mount {
 
 // newMount creates a mount for the sandbox bindings.
 func (c *bwrapConfig) newMount(src, dst string, mountType sandbox.MountType, readOnly bool) (sandbox.Mount, error) {
+	if mountType == sandbox.MountTypeBind {
+		return c.newBindMount(src, dst, readOnly, false /* try */)
+	}
+	if dst == "" {
+		return sandbox.Mount{}, fmt.Errorf("bwrap: destination path is empty")
+	}
+	return sandbox.Mount{Type: mountType, Destination: filepath.Clean(dst)}, nil
+}
+
+// newBindMount creates a bind mount for the sandbox bindings. try is true for
+// the -try flags. It checks SRC before DEST, so that a -try flag with a
+// missing SRC skips the mount whatever DEST is.
+func (c *bwrapConfig) newBindMount(src, dst string, readOnly, try bool) (sandbox.Mount, error) {
+	absSrc, err := c.bindSource(src, try)
+	if err != nil {
+		return sandbox.Mount{}, err
+	}
 	if dst == "" {
 		return sandbox.Mount{}, fmt.Errorf("bwrap: destination path is empty")
 	}
 	dst = filepath.Clean(dst)
-	if mountType != sandbox.MountTypeBind {
-		return sandbox.Mount{Type: mountType, Destination: dst}, nil
-	}
-	absSrc, err := filepath.Abs(src)
-	if err != nil {
-		return sandbox.Mount{}, fmt.Errorf("bwrap: Can't get absolute path for source path %v: %v", src, err)
-	}
-	if _, err := os.Stat(src); err != nil {
-		return sandbox.Mount{}, fmt.Errorf("bwrap: Can't find source path %v: %v", absSrc, err)
-	}
 	m := sandbox.Mount{
 		Type:        sandbox.MountTypeBind,
 		Source:      absSrc,
@@ -143,6 +152,55 @@ func (c *bwrapConfig) newMount(src, dst string, mountType sandbox.MountType, rea
 		m.Recursive, m.Private, m.NoSuid, m.NoDev = true, true, true, true
 	}
 	return m, nil
+}
+
+// bindSource returns the absolute host path of the bind mount source src.
+// The source must exist. For a -try flag (try is true), a directory that an
+// earlier --dir creates on the host also counts.
+func (c *bwrapConfig) bindSource(src string, try bool) (string, error) {
+	// An empty SRC more likely comes from an unset variable than from a
+	// request for the host root, so it fails for every bind flag.
+	if src == "" {
+		return "", fmt.Errorf("bwrap: source path is empty")
+	}
+	absSrc, err := filepath.Abs(src)
+	if err != nil {
+		return "", fmt.Errorf("bwrap: Can't get absolute path for source path %v: %v", src, err)
+	}
+	// Check src as given, so the kernel decides ENOENT and ENOTDIR for
+	// components such as "missing/.." that filepath.Abs cleans away.
+	if _, err := os.Stat(src); err != nil && !(try && errors.Is(err, fs.ErrNotExist) && c.willCreate(src, absSrc)) {
+		return "", fmt.Errorf("bwrap: Can't find source path %v: %w", absSrc, err)
+	}
+	return absSrc, nil
+}
+
+// willCreate reports whether an earlier --dir creates the missing bind mount
+// source src, whose absolute path is absSrc. src may not have a ".."
+// component, which could hide a component that stays missing. Nothing may be
+// at absSrc, not even a dangling symlink, which mkdir leaves as it is. absSrc
+// has no trailing "/" or "/.", which would make lstat follow the symlink.
+func (c *bwrapConfig) willCreate(src, absSrc string) bool {
+	if slices.Contains(strings.Split(src, "/"), "..") || !c.createsHostDir(absSrc) {
+		return false
+	}
+	_, err := os.Lstat(absSrc)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+// createsHostDir reports whether an earlier --dir creates path on the host,
+// as the directory itself or as one of its missing parents.
+func (c *bwrapConfig) createsHostDir(path string) bool {
+	for _, d := range c.HostDirs {
+		if d.ReadOnly {
+			continue
+		}
+		rel, err := filepath.Rel(path, d.Path)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+			return true
+		}
+	}
+	return false
 }
 
 // getRootMount returns the root mount if it exists.

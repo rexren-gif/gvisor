@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/version"
 	"gvisor.dev/gvisor/sandboxexec/sandbox"
 )
 
@@ -62,7 +63,13 @@ const (
 	flagDir           = "dir"
 	flagAsPID1        = "as-pid-1"
 	flagDev           = "dev"
+	flagVersion       = "version"
 )
+
+// bubblewrapVersion is the bubblewrap release that this personality's command
+// line is compatible with. --version reports it, followed by the runsc version. It
+// does not mean that every flag of that release is supported.
+const bubblewrapVersion = "0.11.0"
 
 // Cli implements subcommands.Command for the "bwrap" command.
 type Cli struct {
@@ -94,6 +101,7 @@ type Cli struct {
 	dir           string
 	asPID1        bool
 	dev           string
+	version       bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -140,6 +148,7 @@ func (c *Cli) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.dir, flagDir, "", "Create dir at DEST")
 	f.BoolVar(&c.asPID1, flagAsPID1, false, "Do not install a reaper process with PID=1")
 	f.StringVar(&c.dev, flagDev, "", "Mount new dev on DEST")
+	f.BoolVar(&c.version, flagVersion, false, "Print version")
 
 	// Override the default usage function to print the custom usage message.
 	f.Usage = func() {
@@ -166,6 +175,13 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 	var err error
 	for i := 0; i < len(bwrapArgs); {
 		arg := bwrapArgs[i]
+
+		// Stop at --version without checking the rest of the command line,
+		// a pending --perms included.
+		if arg == "--"+flagVersion {
+			cfg.PrintVersion = true
+			return cfg, nil
+		}
 
 		// --perms only modifies the operation that immediately follows it.
 		if cfg.nextPerms != nil && (!strings.HasPrefix(arg, "--") || !acceptsPerms(strings.TrimPrefix(arg, "--"))) {
@@ -253,30 +269,23 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 	return cfg, nil
 }
 
-func (c *Cli) getBwrapArgs(args []string) []string {
-	delimiter := c.Name()
-	// Skip all arguments until the delimiter.
-	for i, arg := range args {
-		if arg == delimiter {
-			return args[i+1:]
-		}
-	}
-	return nil
-}
-
 // Execute implements subcommands.Command.Execute.
 func (c *Cli) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	conf := args[0].(*config.Config)
 	waitStatus := args[1].(*unix.WaitStatus)
 
-	// Parse bwrap arguments.
-	bwrapArgs := c.getBwrapArgs(os.Args)
-	cfg, err := parseBwrapArgs(bwrapArgs)
+	// The bwrap arguments follow the subcommand name, the first argument
+	// after the global flags. When runsc runs as "bwrap", HandleAlias has
+	// inserted that name.
+	cfg, err := parseBwrapArgs(flag.CommandLine.Args()[1:])
 	if err != nil {
 		return util.Errorf("bwrap: %v", err)
 	}
+	if cfg.PrintVersion {
+		fmt.Fprintf(os.Stdout, "bubblewrap %s (runsc %s)\n", bubblewrapVersion, version.Version())
+		return subcommands.ExitSuccess
+	}
 	cfg.runscConfig = conf
-	// When called as `runsc bwrap`, arguments start at index 2.
 	return do(ctx, cfg, waitStatus)
 }
 

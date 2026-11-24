@@ -891,6 +891,77 @@ func TestParseFlags(t *testing.T) {
 			},
 		},
 		{
+			name: "Version",
+			args: []string{"--version"},
+			wantCfg: &bwrapConfig{
+				Env:          os.Environ(),
+				UID:          -1,
+				GID:          -1,
+				PrintVersion: true,
+			},
+		},
+		{
+			// parseBwrapArgs stops at --version, so it checks neither the
+			// later arguments nor the pending --perms. runsc's own flag parser
+			// still rejects unknown options there.
+			name: "VersionStopsParsing",
+			args: []string{"--chdir", "/tmp", "--perms", "0700", "--version", "--unknown", "--bind"},
+			wantCfg: &bwrapConfig{
+				Env:          os.Environ(),
+				UID:          -1,
+				GID:          -1,
+				Chdir:        "/tmp",
+				PrintVersion: true,
+			},
+		},
+		{
+			// --version as the value of a flag is not the --version flag.
+			name: "VersionAsFlagValue",
+			args: []string{"--chdir", "--version", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:   os.Environ(),
+				UID:   -1,
+				GID:   -1,
+				Chdir: "--version",
+				Args:  []string{"bash"},
+			},
+		},
+		{
+			name: "VersionInCommand",
+			args: []string{"bash", "--version"},
+			wantCfg: &bwrapConfig{
+				Env:  os.Environ(),
+				UID:  -1,
+				GID:  -1,
+				Args: []string{"bash", "--version"},
+			},
+		},
+		{
+			name: "VersionAfterDelimiter",
+			args: []string{"--", "--version"},
+			wantCfg: &bwrapConfig{
+				Env:  os.Environ(),
+				UID:  -1,
+				GID:  -1,
+				Args: []string{"--version"},
+			},
+		},
+		{
+			name:        "SingleDashVersion",
+			args:        []string{"-version"},
+			errContains: "Unknown option: -version",
+		},
+		{
+			name:        "VersionWithValue",
+			args:        []string{"--version=true"},
+			errContains: "Unknown option: --version=true",
+		},
+		{
+			name:        "VersionAfterUnknownFlag",
+			args:        []string{"--unknown", "--version"},
+			errContains: "Unknown option: --unknown",
+		},
+		{
 			name:        "MissingDirArg",
 			args:        []string{"--dir"},
 			errContains: "--dir takes 1 argument",

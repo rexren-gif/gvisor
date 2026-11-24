@@ -22,7 +22,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -1195,4 +1197,146 @@ func TestDev(t *testing.T) {
 			}
 		})
 	}
+}
+
+// runscVersion returns the version that `runsc --version` prints. It must run
+// before testutil.StartReaper, which could reap its child first.
+func runscVersion(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command(specutils.ExePath, "--version").Output()
+	if err != nil {
+		t.Fatalf("runsc --version failed: %v", err)
+	}
+	v, ok := strings.CutPrefix(strings.SplitN(string(out), "\n", 2)[0], "runsc version ")
+	if !ok {
+		t.Fatalf("runsc --version printed %q", out)
+	}
+	return v
+}
+
+// checkVersion runs cmd and checks that it prints only wantVersion.
+func checkVersion(t *testing.T, cmd *exec.Cmd, wantVersion string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := testutil.RunCmd(cmd); err != nil {
+		t.Fatalf("runsc bwrap failed: %v\nStderr: %s", err, stderr.String())
+	}
+	if got := stdout.String(); got != wantVersion {
+		t.Errorf("stdout = %q, want %q", got, wantVersion)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want it empty", stderr.String())
+	}
+}
+
+// TestVersion checks that --version prints the bubblewrap version and exits
+// without running a command or creating a sandbox.
+func TestVersion(t *testing.T) {
+	if err := testutil.ConfigureExePath(); err != nil {
+		t.Fatalf("failed to configure exe path: %v", err)
+	}
+
+	wantVersion := "bubblewrap 0.11.0 (runsc " + runscVersion(t) + ")\n"
+
+	stop := testutil.StartReaper()
+	defer stop()
+
+	// hostDir stands in for a fresh host directory.
+	const hostDir = "HOST_DIR"
+	tests := []struct {
+		name      string
+		bwrapArgs []string
+	}{
+		{
+			name:      "Version",
+			bwrapArgs: []string{"--version"},
+		},
+		{
+			name:      "AfterPerms",
+			bwrapArgs: []string{"--perms", "0700", "--version"},
+		},
+		{
+			name:      "BeforeCommand",
+			bwrapArgs: []string{"--setenv", "FOO", "bar", "--version", "--", "/bin/false"},
+		},
+		{
+			// The --dir is not created on the host.
+			name:      "AfterDir",
+			bwrapArgs: []string{"--bind", hostDir, "/mnt", "--dir", "/mnt/new", "--version"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runRootDir := newRunRootDir(t)
+			dir := t.TempDir()
+
+			args := []string{"--root", runRootDir, "bwrap"}
+			for _, arg := range tc.bwrapArgs {
+				if arg == hostDir {
+					arg = dir
+				}
+				args = append(args, arg)
+			}
+			checkVersion(t, exec.Command(specutils.ExePath, args...), wantVersion)
+
+			for _, d := range []string{runRootDir, dir} {
+				if entries, err := os.ReadDir(d); err != nil || len(entries) != 0 {
+					t.Errorf("%s has %v (err: %v), want it empty", d, entries, err)
+				}
+			}
+		})
+	}
+
+	// The bwrap arguments start after the subcommand, even when a global
+	// flag has the value "bwrap".
+	t.Run("GlobalFlagValue", func(t *testing.T) {
+		checkVersion(t, exec.Command(specutils.ExePath, "--root", newRunRootDir(t), "--debug-command", "bwrap", "bwrap", "--version"), wantVersion)
+	})
+
+	// Tools probe the version as an unprivileged user.
+	t.Run("Unprivileged", func(t *testing.T) {
+		uid, err := strconv.ParseUint(os.Getenv("SUDO_UID"), 10, 32)
+		if err != nil {
+			t.Skipf("SUDO_UID is not set: %v", err)
+		}
+		gid, err := strconv.ParseUint(os.Getenv("SUDO_GID"), 10, 32)
+		if err != nil {
+			t.Skipf("SUDO_GID is not set: %v", err)
+		}
+		cmd := exec.Command(specutils.ExePath, "bwrap", "--version")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
+		checkVersion(t, cmd, wantVersion)
+	})
+
+	// Tools find bwrap through PATH, so argv[0] is the bare name.
+	t.Run("Alias", func(t *testing.T) {
+		link := filepath.Join(t.TempDir(), "bwrap")
+		if err := os.Symlink(specutils.ExePath, link); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(link, "--version")
+		cmd.Args[0] = "bwrap"
+		checkVersion(t, cmd, wantVersion)
+	})
+
+	// runsc's own flag parser takes --version as a flag here, but to bwrap it
+	// is the value of FOO, so the command runs. --setenv comes first because
+	// runsc's parser stops at the first argument that is not an option, the
+	// second "/" of --ro-bind.
+	t.Run("AsSetenvValue", func(t *testing.T) {
+		cmd := exec.Command(specutils.ExePath, "--root", newRunRootDir(t), "bwrap",
+			"--setenv", "FOO", "--version", "--ro-bind", "/", "/", "/bin/sh", "-c", "echo $FOO")
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := testutil.RunCmd(cmd); err != nil {
+			t.Fatalf("runsc bwrap failed: %v\nStderr: %s", err, stderr.String())
+		}
+		if got, want := stdout.String(), "--version\n"; got != want {
+			t.Errorf("stdout = %q, want %q", got, want)
+		}
+	})
 }

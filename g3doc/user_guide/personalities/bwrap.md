@@ -194,3 +194,13 @@ its own to it.
 > combination behaves as it does under native `bwrap`, `--clearenv` included: it
 > takes effect where it appears, wiping what comes before it and keeping what
 > comes after.
+
+### Version
+
+<!-- mdformat off(no multiline table support in Kramdown) -->
+
+| Flag | Arguments | Behavior in gVisor | Difference from `bwrap` |
+| :--- | :--- | :--- | :--- |
+| `--version` | None | Prints `bubblewrap <VERSION> (runsc <RUNSC_VERSION>)` and exits without running a command. `VERSION` is the `bwrap` release that the personality's command line is compatible with. The tables on this page list the flags it supports. `RUNSC_VERSION` is what `runsc --version` reports. | `bwrap` prints only `bubblewrap <VERSION>`. Some options before `--version` are checked as they are for a run, so for example a missing `--bind` source still fails, while an unknown `--cap-add` name does not. Between `--version` and the first argument that is not an option, `runsc` rejects options it does not know, options without their value, and a `--uid` or `--gid` that is not a number. |
+
+<!-- mdformat on -->

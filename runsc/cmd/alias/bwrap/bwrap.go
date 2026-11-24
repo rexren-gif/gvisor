@@ -94,6 +94,10 @@ type bwrapConfig struct {
 	AsPID1      bool
 	hasArgv0    bool
 	nextPerms   *uint32
+
+	// PrintVersion reports whether to print the version instead of running a
+	// command.
+	PrintVersion bool
 }
 
 // String returns a string representation of the bwrapConfig.

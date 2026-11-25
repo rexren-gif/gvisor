@@ -38,6 +38,7 @@ go_test(
     deps = [
         ":sandbox",
         "//pkg/test/testutil",
+        "//runsc/specutils",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
 )

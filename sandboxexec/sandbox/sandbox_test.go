@@ -497,3 +497,51 @@ func TestExecNewPIDNamespace(t *testing.T) {
 		t.Errorf("command without WithExecNewPIDNamespace ran as PID 1")
 	}
 }
+
+func TestSandboxFiles(t *testing.T) {
+	ctx := context.Background()
+	newData := func(content string) *os.File {
+		t.Helper()
+		f, err := os.CreateTemp(t.TempDir(), "data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		if _, err := f.WriteString(content); err != nil {
+			t.Fatal(err)
+		}
+		// The sandbox reads from offset 0, whatever the offset of f is.
+		return f
+	}
+
+	sb, err := sandbox.New(ctx,
+		sandbox.WithMount(sandbox.Mount{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"}),
+		sandbox.WithFiles(
+			sandbox.File{Path: "/mnt/a/b/x", Mode: 0640, Data: newData("first\n")},
+			sandbox.File{Path: "/mnt/y", Mode: 0666, Data: newData("")},
+		),
+	)
+	if err != nil {
+		t.Fatalf("failed to start sandbox: %v", err)
+	}
+	defer func() {
+		if err := sb.Close(ctx); err != nil {
+			t.Fatalf("failed to clean up sandbox: %v", err)
+		}
+	}()
+
+	for _, tc := range []struct {
+		argv []string
+		want string
+	}{
+		{[]string{"stat", "-c", "%a %F %n", "/mnt/a", "/mnt/a/b"}, "750 directory /mnt/a\n750 directory /mnt/a/b\n"},
+		{[]string{"stat", "-c", "%a %s %n", "/mnt/a/b/x", "/mnt/y"}, "640 6 /mnt/a/b/x\n666 0 /mnt/y\n"},
+		{[]string{"cat", "/mnt/a/b/x"}, "first\n"},
+		// The init process does not keep the descriptors of the data.
+		{[]string{"ls", "/proc/1/fd"}, "0\n1\n2\n"},
+	} {
+		if got := execOutput(ctx, t, sb, tc.argv...); got != tc.want {
+			t.Errorf("%v = %q, want %q", tc.argv, got, tc.want)
+		}
+	}
+}

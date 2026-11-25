@@ -16,6 +16,7 @@ package boot
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -66,6 +67,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/timing"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -283,6 +285,32 @@ func setupContainerVFS(ctx context.Context, info *containerInfo, mntr *container
 		return fmt.Errorf("failed to create device files: %w", err)
 	}
 	procArgs.StartupTimeline.Reached("device files created")
+
+	// Create the files before the working directory, so that the parent
+	// directories of a file belong to the container user even when the
+	// working directory is below one of them. This step creates only
+	// directories and regular files, so the step below, which uses
+	// rootCreds, cannot go through a symlink that it made.
+	files, err := specutils.Files(info.spec)
+	if err != nil {
+		return err
+	}
+	if len(files) > 0 {
+		fileCreds, err := execCredentials(procArgs)
+		if err != nil {
+			return err
+		}
+		fileArgs := *procArgs
+		fileArgs.Credentials = fileCreds
+		passed := make([]int, 0, len(info.passFDs))
+		for _, m := range info.passFDs {
+			passed = append(passed, m.guest)
+		}
+		if err := createFiles(fileArgs.NewContext(mntr.l.k), fileCreds, mntr.l.k.VFS(), mnsRoot, procArgs.FDTable, passed, files); err != nil {
+			return err
+		}
+		procArgs.StartupTimeline.Reached("files created")
+	}
 
 	if err := mntr.l.k.VFS().MkdirAllAt(
 		ctx, procArgs.WorkingDirectory, mnsRoot, rootCreds,
@@ -1767,6 +1795,163 @@ func (c *containerMounter) makeMountPoint(
 		}
 	}
 	return nil
+}
+
+// execCredentials returns the credentials of the container's init process
+// once it runs its program. The effective capabilities are those that remain
+// after execve(2), so that steps that use these credentials need no
+// permission that the program does not have. The container's seccomp filter
+// does not apply to them.
+func execCredentials(procArgs *kernel.CreateProcessArgs) (*auth.Credentials, error) {
+	execCreds, _, err := auth.ComputeCredsForExec(procArgs.Credentials,
+		auth.FilePrivileges{SetUserID: auth.NoID, SetGroupID: auth.NoID}, "", /* filename */
+		procArgs.NoNewPrivs, false /* stopPrivGain */, false /* allowSUID */)
+	if err != nil {
+		return nil, fmt.Errorf("computing credentials of the init process: %w", err)
+	}
+	creds := procArgs.Credentials.Fork()
+	creds.EffectiveCaps &= execCreds.EffectiveCaps
+	return creds, nil
+}
+
+// fileCopyChunk is the size of the buffer that createFile copies data with.
+const fileCopyChunk = 64 << 10
+
+// createFiles creates files in order, with creds. Call it once all mounts are
+// in place and read-only mounts are read-only again. The data of each file
+// comes from a descriptor in fdTable, which must be one of the passed guest
+// descriptors. createFiles removes each descriptor from fdTable when it
+// starts to use it.
+func createFiles(ctx context.Context, creds *auth.Credentials, vfsObj *vfs.VirtualFilesystem, root vfs.VirtualDentry, fdTable *kernel.FDTable, passed []int, files []specutils.File) error {
+	for _, f := range files {
+		if err := createFile(ctx, creds, vfsObj, root, fdTable, passed, f); err != nil {
+			return fmt.Errorf("creating file %q from fd %d: %w", f.Path, f.FD, err)
+		}
+	}
+	return nil
+}
+
+// createFile creates f.Path, or truncates the regular file that is there, and
+// copies all the data of descriptor f.FD into it. Missing parent directories
+// are created with mode fileParentMode(f.Mode). Any other type of file at
+// f.Path is an error: a symlink is not followed, and a named pipe or a device
+// is not opened in a mode that blocks or truncates.
+func createFile(ctx context.Context, creds *auth.Credentials, vfsObj *vfs.VirtualFilesystem, root vfs.VirtualDentry, fdTable *kernel.FDTable, passed []int, f specutils.File) error {
+	if !slices.Contains(passed, f.FD) {
+		return fmt.Errorf("the descriptor is not one that --pass-fd gives the container")
+	}
+	src := fdTable.Remove(ctx, int32(f.FD))
+	if src == nil {
+		return linuxerr.EBADF
+	}
+	defer src.DecRef(ctx)
+	// Check this before any change to the filesystem.
+	if !src.IsReadable() {
+		return linuxerr.EBADF
+	}
+	stat, err := src.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_TYPE})
+	if err != nil {
+		return err
+	}
+	if stat.Mask&linux.STATX_TYPE == 0 || stat.Mode&linux.FileTypeMask != linux.ModeRegular {
+		return fmt.Errorf("the descriptor does not refer to a regular file")
+	}
+
+	if err := vfsObj.MkdirAllAt(ctx, path.Dir(f.Path), root, creds, &vfs.MkdirOptions{Mode: fileParentMode(f.Mode)}, true /* mustBeDir */); err != nil {
+		return err
+	}
+	pop := &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(f.Path),
+	}
+	// Do not open a file that is not a regular file, because opening a
+	// device can have side effects. The check after the open covers a file
+	// that changes in between.
+	stat, err = vfsObj.StatAt(ctx, creds, pop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
+	switch {
+	case err == nil:
+		if err := checkRegularFile(stat); err != nil {
+			return err
+		}
+	case !linuxerr.Equals(linuxerr.ENOENT, err):
+		return err
+	}
+	dst, err := vfsObj.OpenAt(ctx, creds, pop, &vfs.OpenOptions{
+		Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_NOFOLLOW | linux.O_NONBLOCK,
+		Mode:  linux.FileMode(f.Mode),
+	})
+	if err != nil {
+		return err
+	}
+	defer dst.DecRef(ctx)
+	stat, err = dst.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_TYPE | linux.STATX_SIZE})
+	if err != nil {
+		return err
+	}
+	if err := checkRegularFile(stat); err != nil {
+		return err
+	}
+	if stat.Mask&linux.STATX_SIZE == 0 || stat.Size != 0 {
+		// Truncation clears the set-user-ID and set-group-ID bits, as
+		// ftruncate(2) does.
+		if err := dst.SetStat(ctx, vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_SIZE}, ClearPrivs: true}); err != nil {
+			return err
+		}
+	}
+
+	buf := make([]byte, fileCopyChunk)
+	for off := int64(0); ; {
+		n, readErr := src.PRead(ctx, usermem.BytesIOSequence(buf), off, vfs.ReadOptions{})
+		off += n
+		for data := buf[:n]; len(data) > 0; {
+			w, err := dst.Write(ctx, usermem.BytesIOSequence(data), vfs.WriteOptions{})
+			if err != nil {
+				return err
+			}
+			data = data[w:]
+		}
+		if readErr == io.EOF || (readErr == nil && n == 0) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+}
+
+// checkRegularFile returns nil if stat is that of a regular file. Otherwise it
+// returns EISDIR for a directory, ELOOP for a symlink, and an error that names
+// the problem for any other type of file.
+func checkRegularFile(stat linux.Statx) error {
+	if stat.Mask&linux.STATX_TYPE == 0 {
+		return fmt.Errorf("the type of the file that is already there is unknown")
+	}
+	switch stat.Mode & linux.FileTypeMask {
+	case linux.ModeRegular:
+		return nil
+	case linux.ModeDirectory:
+		return linuxerr.EISDIR
+	case linux.ModeSymlink:
+		return linuxerr.ELOOP
+	default:
+		return fmt.Errorf("a file that is not a regular file is already there")
+	}
+}
+
+// fileParentMode returns the mode of the parent directories that createFile
+// creates for a file with mode perms: 0755, without the group bits if perms
+// grants no group access, and without the other bits if perms grants no
+// other access.
+func fileParentMode(perms uint32) linux.FileMode {
+	mode := linux.FileMode(0755)
+	if perms&0070 == 0 {
+		mode &^= 0050
+	}
+	if perms&0007 == 0 {
+		mode &^= 0005
+	}
+	return mode
 }
 
 // configureRestore returns an updated context.Context including filesystem

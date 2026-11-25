@@ -978,6 +978,188 @@ func TestProductName(t *testing.T) {
 	}
 }
 
+// TestFilesAnnotation checks that the files annotation creates its files, and
+// their missing parents, from descriptors that --pass-fd gives, with the
+// permissions of the container's init process.
+func TestFilesAnnotation(t *testing.T) {
+	newData := func(t *testing.T, data string) *os.File {
+		f, err := os.CreateTemp(t.TempDir(), "data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		if _, err := f.WriteString(data); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	for _, tc := range []struct {
+		name  string
+		files string
+		// pass returns the files that --pass-fd gives, by guest descriptor.
+		pass func(t *testing.T) map[int]*os.File
+		// mntMode is the mode of the tmpfs at /mnt.
+		mntMode string
+		// nonRoot runs the container as 1000:1000 with caps, by default
+		// none.
+		nonRoot bool
+		caps    []string
+		// ambient also makes caps inheritable and ambient.
+		ambient bool
+		// fifo binds a host directory that holds a named pipe "p" at the
+		// same path, replaces files with one entry for "p", and lets the
+		// gofer open host named pipes.
+		fifo bool
+		cwd  string
+		// script runs in the container and must succeed.
+		script  string
+		wantErr string
+	}{
+		{
+			name:    "Created",
+			files:   `[{"fd": 5, "path": "/mnt/a/b/x", "mode": 416}]`,
+			pass:    func(t *testing.T) map[int]*os.File { return map[int]*os.File{5: newData(t, "hello")} },
+			mntMode: "0755",
+			script:  `test "$(cat /mnt/a/b/x)" = hello && test "$(stat -c '%a %u' /mnt/a /mnt/a/b /mnt/a/b/x | tr '\n' ' ')" = "750 0 750 0 640 0 " && test ! -e /proc/self/fd/5`,
+		},
+		{
+			// The working directory is created after the files, so the
+			// parents of a file belong to the container user.
+			name:    "WorkingDirectoryAfterFiles",
+			files:   `[{"fd": 5, "path": "/mnt/a/x", "mode": 438}]`,
+			pass:    func(t *testing.T) map[int]*os.File { return map[int]*os.File{5: newData(t, "")} },
+			mntMode: "1777",
+			nonRoot: true,
+			cwd:     "/mnt/a",
+			script:  `test "$(stat -c '%u %g' . x | tr '\n' ' ')" = "1000 1000 1000 1000 "`,
+		},
+		{
+			// Without ambient capabilities, a non-root program loses its
+			// capabilities at execve(2), and so do the files.
+			name:    "CapabilitiesLostAtExec",
+			files:   `[{"fd": 5, "path": "/mnt/x", "mode": 438}]`,
+			pass:    func(t *testing.T) map[int]*os.File { return map[int]*os.File{5: newData(t, "")} },
+			mntMode: "0755",
+			nonRoot: true,
+			caps:    []string{"CAP_DAC_OVERRIDE"},
+			wantErr: `creating file "/mnt/x" from fd 5: permission denied`,
+		},
+		{
+			name:    "NotPassed",
+			files:   `[{"fd": 6, "path": "/mnt/x", "mode": 438}]`,
+			pass:    func(t *testing.T) map[int]*os.File { return map[int]*os.File{5: newData(t, "")} },
+			mntMode: "0755",
+			wantErr: "not one that --pass-fd gives",
+		},
+		{
+			name:  "NotRegular",
+			files: `[{"fd": 5, "path": "/mnt/x", "mode": 438}]`,
+			pass: func(t *testing.T) map[int]*os.File {
+				r, w, err := os.Pipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { r.Close(); w.Close() })
+				return map[int]*os.File{5: r}
+			},
+			mntMode: "0755",
+			wantErr: "does not refer to a regular file",
+		},
+		{
+			// A failure on a later file stops the start.
+			name:  "ReadOnlyRoot",
+			files: `[{"fd": 5, "path": "/mnt/x", "mode": 438}, {"fd": 6, "path": "/gvisor-file-test", "mode": 438}]`,
+			pass: func(t *testing.T) map[int]*os.File {
+				return map[int]*os.File{5: newData(t, ""), 6: newData(t, "")}
+			},
+			mntMode: "0755",
+			wantErr: `creating file "/gvisor-file-test" from fd 6: read-only file system`,
+		},
+		{
+			// A named pipe at the path is not opened, so it cannot block
+			// the start, even when the gofer may open host named pipes.
+			name:    "NamedPipe",
+			pass:    func(t *testing.T) map[int]*os.File { return map[int]*os.File{5: newData(t, "x")} },
+			mntMode: "0755",
+			fifo:    true,
+			wantErr: `/p" from fd 5: a file that is not a regular file is already there`,
+		},
+		{
+			// A capability that the program keeps after execve(2) applies
+			// to the files too.
+			name:    "AmbientCapabilityKept",
+			files:   `[{"fd": 5, "path": "/mnt/x", "mode": 438}]`,
+			pass:    func(t *testing.T) map[int]*os.File { return map[int]*os.File{5: newData(t, "")} },
+			mntMode: "0755",
+			nonRoot: true,
+			caps:    []string{"CAP_DAC_OVERRIDE"},
+			ambient: true,
+			script:  `test "$(stat -c '%u' /mnt/x)" = 1000`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := tc.script
+			if script == "" {
+				script = "true"
+			}
+			spec := testutil.NewSpecWithArgs("/bin/sh", "-c", script)
+			spec.Mounts = append(spec.Mounts, specs.Mount{Type: "tmpfs", Destination: "/mnt", Options: []string{"mode=" + tc.mntMode}})
+			spec.Annotations = map[string]string{specutils.AnnotationFiles: tc.files}
+			if tc.nonRoot {
+				spec.Process.User = specs.User{UID: 1000, GID: 1000}
+				spec.Process.Capabilities = &specs.LinuxCapabilities{
+					Bounding:  tc.caps,
+					Effective: tc.caps,
+					Permitted: tc.caps,
+				}
+				if tc.ambient {
+					spec.Process.Capabilities.Inheritable = tc.caps
+					spec.Process.Capabilities.Ambient = tc.caps
+				}
+			}
+			if tc.cwd != "" {
+				spec.Process.Cwd = tc.cwd
+			}
+			conf := testutil.TestConfig(t)
+			if tc.fifo {
+				dir := t.TempDir()
+				if err := unix.Mkfifo(filepath.Join(dir, "p"), 0666); err != nil {
+					t.Fatal(err)
+				}
+				spec.Mounts = append(spec.Mounts, specs.Mount{Type: "bind", Source: dir, Destination: dir})
+				spec.Annotations[specutils.AnnotationFiles] = fmt.Sprintf(`[{"fd": 5, "path": %q, "mode": 438}]`, filepath.Join(dir, "p"))
+				conf.HostFifo = config.HostFifoOpen
+			}
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+				Attached:  true,
+				PassFiles: tc.pass(t),
+			}
+			ws, err := Run(conf, args)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("running container got error %v, want error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("running container: %v", err)
+			}
+			if !ws.Exited() || ws.ExitStatus() != 0 {
+				t.Fatalf("container failed, waitStatus: %v", ws)
+			}
+		})
+	}
+}
+
 // Test the we can execute the application with different path formats.
 func TestExePath(t *testing.T) {
 	// Create two directories that will be prepended to PATH.

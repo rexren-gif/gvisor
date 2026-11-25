@@ -62,6 +62,7 @@ const (
 	flagDir           = "dir"
 	flagAsPID1        = "as-pid-1"
 	flagDev           = "dev"
+	flagFile          = "file"
 )
 
 // Cli implements subcommands.Command for the "bwrap" command.
@@ -94,6 +95,7 @@ type Cli struct {
 	dir           string
 	asPID1        bool
 	dev           string
+	file          string
 }
 
 // Name implements subcommands.Command.Name.
@@ -136,10 +138,11 @@ func (c *Cli) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&c.newSession, flagNewSession, false, "Create a new terminal session")
 	f.BoolVar(&c.dieWithParent, flagDieWithParent, false, "Kills with SIGKILL child process (COMMAND) when runsc or runsc's parent dies")
 	f.StringVar(&c.argv0, flagArgv0, "", "Set argv[0] to VALUE before running the program")
-	f.StringVar(&c.perms, flagPerms, "", "Set permissions of the next argument (--tmpfs, --dir)")
+	f.StringVar(&c.perms, flagPerms, "", "Set permissions of the next argument (--tmpfs, --dir, --file)")
 	f.StringVar(&c.dir, flagDir, "", "Create dir at DEST")
 	f.BoolVar(&c.asPID1, flagAsPID1, false, "Do not install a reaper process with PID=1")
 	f.StringVar(&c.dev, flagDev, "", "Mount new dev on DEST")
+	f.StringVar(&c.file, flagFile, "", "Read all data from file descriptor FD and store it in a regular file at DEST (takes FD DEST)")
 
 	// Override the default usage function to print the custom usage message.
 	f.Usage = func() {
@@ -237,6 +240,8 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 			i, err = cfg.parseAsPID1(bwrapArgs, i)
 		case flagDev:
 			i, err = cfg.parseDev(bwrapArgs, i)
+		case flagFile:
+			i, err = cfg.parseFile(bwrapArgs, i)
 		default:
 			return nil, fmt.Errorf("bwrap: Unknown option: %s", arg)
 		}
@@ -292,7 +297,9 @@ func (c *bwrapConfig) parseBind(args []string, i int) (int, error) {
 	if err != nil {
 		return i, err
 	}
-	c.Mounts = append(c.Mounts, mnt)
+	if err := c.addMounts(mnt); err != nil {
+		return i, err
+	}
 	return i + 3, nil
 }
 
@@ -304,7 +311,9 @@ func (c *bwrapConfig) parseRoBind(args []string, i int) (int, error) {
 	if err != nil {
 		return i, err
 	}
-	c.Mounts = append(c.Mounts, mnt)
+	if err := c.addMounts(mnt); err != nil {
+		return i, err
+	}
 	return i + 3, nil
 }
 
@@ -317,7 +326,9 @@ func (c *bwrapConfig) parseTmpfs(args []string, i int) (int, error) {
 		return i, err
 	}
 	mnt.Mode = c.takePerms()
-	c.Mounts = append(c.Mounts, mnt)
+	if err := c.addMounts(mnt); err != nil {
+		return i, err
+	}
 	return i + 2, nil
 }
 
@@ -328,13 +339,23 @@ func (c *bwrapConfig) parseTmpfs(args []string, i int) (int, error) {
 // in a sandbox filesystem that runsc cannot reach before the sandbox starts.
 // DEST already exists there if an earlier mount sits at or below it, so --dir
 // does nothing. If not, an empty tmpfs mounted at DEST stands in for the
-// directory.
+// directory. An earlier --file decides first: --dir fails at or below that
+// file, and does nothing above it, because the sandbox creates the parents
+// of the file.
 func (c *bwrapConfig) parseDir(args []string, i int) (int, error) {
 	if i+1 >= len(args) {
 		return i, fmt.Errorf("bwrap: --%s takes 1 argument", flagDir)
 	}
 	dst := args[i+1]
 	perms := c.takePerms()
+	if dst != "" {
+		if f, ok := c.fileAtOrAbove(dst); ok {
+			return i, fmt.Errorf("bwrap: Can't mkdir %s: --%s %s is not a directory", filepath.Join("/", dst), flagFile, f.Dest)
+		}
+		if c.hasFileBelow(dst) {
+			return i + 2, nil
+		}
+	}
 	if bind, hostPath, ok := c.hostPath(dst); ok {
 		dir := HostDir{Dest: dst, Path: hostPath, ReadOnly: bind.ReadOnly, Perms: defaultDirPerms}
 		if perms != nil {
@@ -351,7 +372,9 @@ func (c *bwrapConfig) parseDir(args []string, i int) (int, error) {
 		return i, err
 	}
 	mnt.Mode = perms
-	c.Mounts = append(c.Mounts, mnt)
+	if err := c.addMounts(mnt); err != nil {
+		return i, err
+	}
 	return i + 2, nil
 }
 
@@ -444,14 +467,16 @@ func (c *bwrapConfig) parseProc(args []string, i int) (int, error) {
 	dst := filepath.Clean(args[i+1])
 	for _, m := range c.Mounts {
 		if m.Type == sandbox.MountTypeProc && m.Destination == dst {
-			return i + 2, nil
+			return i + 2, c.coverFiles(m)
 		}
 	}
 	mnt, err := c.newMount("", dst, sandbox.MountTypeProc, false /* readOnly */)
 	if err != nil {
 		return i, err
 	}
-	c.Mounts = append(c.Mounts, mnt)
+	if err := c.addMounts(mnt); err != nil {
+		return i, err
+	}
 
 	return i + 2, nil
 }
@@ -467,7 +492,7 @@ func (c *bwrapConfig) parseDev(args []string, i int) (int, error) {
 	dst := filepath.Clean(args[i+1])
 	for _, m := range append(defaultMounts(), c.Mounts...) {
 		if m.Type == sandbox.MountTypeDevtmpfs && m.Destination == dst {
-			return i + 2, nil
+			return i + 2, c.coverFiles(m)
 		}
 	}
 	dev, err := c.newMount("", dst, sandbox.MountTypeDevtmpfs, false /* readOnly */)
@@ -478,9 +503,49 @@ func (c *bwrapConfig) parseDev(args []string, i int) (int, error) {
 	if err != nil {
 		return i, err
 	}
-	c.Mounts = append(c.Mounts, dev, pts)
+	if err := c.addMounts(dev, pts); err != nil {
+		return i, err
+	}
 
 	return i + 2, nil
+}
+
+// parseFile handles --file FD DEST. DEST is made absolute, and the perms of a
+// preceding --perms apply, defaultFilePerms otherwise. do() reads the data of
+// FD before the sandbox starts (see readFiles). The sandbox creates the file
+// only after all mounts (see sandbox.WithFiles), so the mount flags apply the
+// command-line order instead: a later mount at or above DEST hides the file,
+// and a later mount, --dir or --file below DEST fails, because DEST is not a
+// directory. A later --file at DEST replaces the data.
+func (c *bwrapConfig) parseFile(args []string, i int) (int, error) {
+	if i+2 >= len(args) {
+		return i, fmt.Errorf("bwrap: --%s takes 2 arguments", flagFile)
+	}
+	perms := c.takePerms()
+	fd, err := strconv.ParseInt(args[i+1], 10, 32)
+	if err != nil || fd < 0 {
+		return i, fmt.Errorf("bwrap: Invalid fd: %s", args[i+1])
+	}
+	if args[i+2] == "" {
+		return i, fmt.Errorf("bwrap: destination path is empty")
+	}
+	f := File{FD: int(fd), Dest: filepath.Join("/", args[i+2]), Perms: defaultFilePerms}
+	if perms != nil {
+		// A file that runsc fills with data never gets the set-user-ID or
+		// set-group-ID bit.
+		f.Perms = *perms &^ (unix.S_ISUID | unix.S_ISGID)
+	}
+	if f.Dest == "/" {
+		return i, fmt.Errorf("bwrap: Can't create file /: %v", unix.EISDIR)
+	}
+	if c.hasFileBelow(f.Dest) {
+		return i, fmt.Errorf("bwrap: Can't create file %s: %v", f.Dest, unix.EISDIR)
+	}
+	if prev, ok := c.fileAtOrAbove(filepath.Dir(f.Dest)); ok {
+		return i, fmt.Errorf("bwrap: Can't create file %s: --%s %s is not a directory", f.Dest, flagFile, prev.Dest)
+	}
+	c.Files = append(c.Files, f)
+	return i + 3, nil
 }
 
 // TODO: b/518882196 - Support joining existing user namespaces.
@@ -584,8 +649,8 @@ func (c *bwrapConfig) parsePerms(args []string, i int) (int, error) {
 // acceptsPerms reports whether the flag consumes a pending --perms value.
 // --perms itself is included so that repeating it reports its own error.
 //
-// TODO: b/508701483 - bubblewrap also accepts --perms before --file, --bind-data
-// and --ro-bind-data. Add them here as they are implemented.
+// TODO: b/508701483 - Accept --perms before --bind-data and --ro-bind-data
+// once they are implemented.
 func acceptsPerms(flagName string) bool {
-	return flagName == flagTmpfs || flagName == flagDir || flagName == flagPerms
+	return flagName == flagTmpfs || flagName == flagDir || flagName == flagFile || flagName == flagPerms
 }

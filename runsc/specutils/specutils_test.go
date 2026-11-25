@@ -586,6 +586,21 @@ func TestSpecInvalid(t *testing.T) {
 			noRootContainer: true,
 			error:           "Spec.Windows is not supported",
 		},
+		{
+			name: "sandbox spec rejects files",
+			spec: specs.Spec{
+				Annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/x"}]`},
+			},
+			noRootContainer: true,
+			error:           "there is no root container",
+		},
+		{
+			name: "sandbox spec accepts no files",
+			spec: specs.Spec{
+				Annotations: map[string]string{AnnotationFiles: `[]`},
+			},
+			noRootContainer: true,
+		},
 	} {
 		err := ValidateSpec(&test.spec, &test.conf, test.noRootContainer)
 		if len(test.error) == 0 {
@@ -1526,5 +1541,115 @@ func TestApplyNSRestoresThreadNamespace(t *testing.T) {
 	}
 	if restoredNS != threadNS {
 		t.Errorf("after restore, thread netns = %q, want %q (leader netns is %q)", restoredNS, threadNS, leaderNS)
+	}
+}
+
+func TestFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		want        []File
+		wantErr     string
+	}{
+		{
+			name: "unset",
+		},
+		{
+			name:        "set",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/etc/x", "mode": 438}, {"fd": 4, "path": "/a//b/", "mode": 0}]`},
+			want:        []File{{FD: 3, Path: "/etc/x", Mode: 0666}, {FD: 4, Path: "/a/b"}},
+		},
+		{
+			name:        "empty array",
+			annotations: map[string]string{AnnotationFiles: `[]`},
+			want:        []File{},
+		},
+		{
+			name:        "null",
+			annotations: map[string]string{AnnotationFiles: `null`},
+			wantErr:     "not a JSON array",
+		},
+		{
+			name:        "not JSON",
+			annotations: map[string]string{AnnotationFiles: `x:/etc/x`},
+			wantErr:     "invalid character",
+		},
+		{
+			name:        "unknown field",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/etc/x", "target": "y"}]`},
+			wantErr:     "unknown field",
+		},
+		{
+			name:        "trailing data",
+			annotations: map[string]string{AnnotationFiles: `[] []`},
+			wantErr:     "unexpected data",
+		},
+		{
+			name:        "negative fd",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": -1, "path": "/etc/x"}]`},
+			wantErr:     "fds 0 to 2 are the standard streams",
+		},
+		{
+			name:        "standard stream fd",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 2, "path": "/etc/x"}]`},
+			wantErr:     "fds 0 to 2 are the standard streams",
+		},
+		{
+			name:        "repeated fd",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/a"}, {"fd": 3, "path": "/b"}]`},
+			wantErr:     "uses fd 3 of an earlier entry",
+		},
+		{
+			name:        "relative path",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "etc/x"}]`},
+			wantErr:     "not absolute",
+		},
+		{
+			name:        "root path",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/."}]`},
+			wantErr:     "root directory",
+		},
+		{
+			name:        "dot-dot path",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/a/../b"}]`},
+			wantErr:     `".." component`,
+		},
+		{
+			name:        "NUL byte",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/a\u0000b"}]`},
+			wantErr:     "NUL byte",
+		},
+		{
+			name:        "longest path",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/` + strings.Repeat("a", 4094) + `"}]`},
+			want:        []File{{FD: 3, Path: "/" + strings.Repeat("a", 4094)}},
+		},
+		{
+			name:        "long path",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/` + strings.Repeat("a", 4096) + `"}]`},
+			wantErr:     "too long",
+		},
+		{
+			name:        "mode too large",
+			annotations: map[string]string{AnnotationFiles: `[{"fd": 3, "path": "/a", "mode": 4096}]`},
+			wantErr:     "bits outside 07777",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := &specs.Spec{Annotations: tc.annotations}
+			got, err := Files(spec)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Files() error = %v, want error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Files() failed: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Files() = %+v, want %+v", got, tc.want)
+			}
+		})
 	}
 }

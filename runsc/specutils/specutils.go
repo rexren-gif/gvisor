@@ -25,6 +25,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,6 +82,17 @@ const (
 	// Usage:
 	//	"dev.gvisor.dmi.product-name": "<name>"
 	AnnotationProductName = "dev.gvisor.dmi.product-name"
+
+	// AnnotationFiles lists regular files to create in the container's
+	// filesystem once all of its mounts are in place, before its working
+	// directory is created. The value is a JSON array of File objects. runsc fills each file
+	// with the data of a descriptor that --pass-fd gives the container, in
+	// order, with the user of the container's init process and the
+	// capabilities that it keeps after execve(2). See Files.
+	//
+	// Usage:
+	//	"dev.gvisor.files": "[{\"fd\": 3, \"path\": \"/etc/x\", \"mode\": 420}]"
+	AnnotationFiles = "dev.gvisor.files"
 
 	// annotationSeccomp indicates what seccomp rules was set to a given container.
 	//
@@ -221,6 +233,12 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config, noRootContainer bool) e
 
 	if _, err := ProductName(spec); err != nil {
 		return err
+	}
+
+	if files, err := Files(spec); err != nil {
+		return err
+	} else if len(files) > 0 && noRootContainer {
+		return fmt.Errorf("annotation %s is set, but there is no root container to create the files in", AnnotationFiles)
 	}
 
 	// CRI specifies whether a container should start a new sandbox, or run
@@ -1129,6 +1147,80 @@ func ProductName(spec *specs.Spec) (string, error) {
 	return name, nil
 }
 
+// File is one entry of the AnnotationFiles annotation.
+type File struct {
+	// FD is the guest descriptor, given by --pass-fd, that holds the data.
+	// It must be 3 or more, because 0 to 2 are the standard streams, and it
+	// must refer to a regular file. runsc reads all of the file, from
+	// offset 0, and then closes the descriptor in the container's init
+	// process.
+	FD int `json:"fd"`
+
+	// Path is the absolute path of the file in the container. It must not
+	// be "/" or have a ".." component. A missing file is created, and an
+	// existing regular file is truncated first. Any other type of file at
+	// Path is an error, and a symlink there is not followed.
+	Path string `json:"path"`
+
+	// Mode is the permission bits of a new file. An existing file keeps its
+	// mode.
+	Mode uint32 `json:"mode"`
+}
+
+// Files returns the files that the AnnotationFiles annotation lists, in
+// order, with each Path made clean. It returns an error if the annotation is
+// not a JSON array of File objects (null included), or if an entry has an FD
+// below 3 or an FD that an earlier entry uses, a Path that is relative,
+// "/" or has a ".." component, a NUL byte, or PATH_MAX bytes or more, or a
+// Mode with bits outside 07777.
+func Files(spec *specs.Spec) ([]File, error) {
+	if spec == nil {
+		return nil, nil
+	}
+	val, ok := spec.Annotations[AnnotationFiles]
+	if !ok {
+		return nil, nil
+	}
+	var files []File
+	decoder := json.NewDecoder(strings.NewReader(val))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&files); err != nil {
+		return nil, fmt.Errorf("annotation %s: %w", AnnotationFiles, err)
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, fmt.Errorf("annotation %s: unexpected data after the JSON array", AnnotationFiles)
+	}
+	if files == nil {
+		return nil, fmt.Errorf("annotation %s: the value is not a JSON array", AnnotationFiles)
+	}
+	fds := make(map[int]struct{}, len(files))
+	for i := range files {
+		f := &files[i]
+		_, dup := fds[f.FD]
+		switch {
+		case f.FD < 3:
+			return nil, fmt.Errorf("annotation %s: entry %d has fd %d, but fds 0 to 2 are the standard streams", AnnotationFiles, i, f.FD)
+		case dup:
+			return nil, fmt.Errorf("annotation %s: entry %d uses fd %d of an earlier entry", AnnotationFiles, i, f.FD)
+		case !path.IsAbs(f.Path):
+			return nil, fmt.Errorf("annotation %s: entry %d has a path that is not absolute: %q", AnnotationFiles, i, f.Path)
+		case path.Clean(f.Path) == "/":
+			return nil, fmt.Errorf("annotation %s: entry %d has the root directory as its path", AnnotationFiles, i)
+		case slices.Contains(strings.Split(f.Path, "/"), ".."):
+			return nil, fmt.Errorf("annotation %s: entry %d has a path with a \"..\" component: %q", AnnotationFiles, i, f.Path)
+		case strings.ContainsRune(f.Path, 0):
+			return nil, fmt.Errorf("annotation %s: entry %d contains a NUL byte", AnnotationFiles, i)
+		case len(f.Path) >= linux.PATH_MAX:
+			return nil, fmt.Errorf("annotation %s: entry %d is too long", AnnotationFiles, i)
+		case f.Mode&^07777 != 0:
+			return nil, fmt.Errorf("annotation %s: entry %d has a mode with bits outside 07777: %#o", AnnotationFiles, i, f.Mode)
+		}
+		fds[f.FD] = struct{}{}
+		f.Path = path.Clean(f.Path)
+	}
+	return files, nil
+}
+
 // IsProcFDPath returns true if the path is a numeric procfs/devfd magic link
 // (e.g. /proc/self/fd/3, /proc/thread-self/fd/4, /dev/fd/5).
 func IsProcFDPath(path string) bool {
@@ -1222,6 +1314,7 @@ func Features() *features.Features {
 		annotations["dev.gvisor.container-name-remap."] = ""
 		annotations[AnnotationRootfsUpperTar] = ""
 		annotations[AnnotationProductName] = ""
+		annotations[AnnotationFiles] = ""
 		annotations["dev.gvisor.internal.seccomp."] = ""
 		annotations["dev.gvisor.internal.seccomp.cont"] = "RuntimeDefault"
 		annotations[AnnotationTPU] = ""
@@ -1240,6 +1333,7 @@ func Features() *features.Features {
 		unsafeAnnotations = append(unsafeAnnotations,
 			"dev.gvisor.container-name-remap.",
 			AnnotationRootfsUpperTar,
+			AnnotationFiles,
 			"dev.gvisor.internal.seccomp.",
 			AnnotationTPU,
 			AnnotationCPUFeatures,

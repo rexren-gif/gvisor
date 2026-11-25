@@ -16,6 +16,7 @@ package bwrap
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -1194,5 +1195,592 @@ func TestDev(t *testing.T) {
 				t.Errorf("output = %q, want %q", got, "ok")
 			}
 		})
+	}
+}
+
+// dataPipe returns the read end of a pipe that a goroutine fills with data
+// and then closes. The caller must close the read end.
+func dataPipe(t *testing.T, data []byte) *os.File {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		// The write fails with EPIPE if runsc does not read the pipe.
+		_, _ = w.Write(data)
+		w.Close()
+	}()
+	return r
+}
+
+func TestFile(t *testing.T) {
+	if err := testutil.ConfigureExePath(); err != nil {
+		t.Fatalf("failed to configure exe path: %v", err)
+	}
+
+	stop := testutil.StartReaper()
+	defer stop()
+
+	big := bytes.Repeat([]byte("0123456789abcdef"), 3<<20/16)
+	bigSum := fmt.Sprintf("%x  -", sha256.Sum256(big))
+
+	// The tmpfs root cases bind only what the commands need. /bin, /lib and
+	// /lib64 may be symlinks into /usr, so bind what they point to.
+	tmpfsRoot := []string{"--ro-bind", "/usr", "/usr"}
+	for _, dir := range []string{"/bin", "/lib", "/lib64"} {
+		src, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			continue
+		}
+		tmpfsRoot = append(tmpfsRoot, "--ro-bind", src, dir)
+	}
+
+	// hostDir is a host directory, made fresh for each case.
+	const hostDir = "HOST_DIR"
+	tests := []struct {
+		name string
+		// setup prepares hostDir before the run.
+		setup func(t *testing.T, hostDir string)
+		// bwrapArgs are the arguments, with hostDir standing in for the host
+		// directory.
+		bwrapArgs []string
+		// fds returns the descriptors that runsc gets from 3 on. The
+		// default is one pipe that holds "data\n".
+		fds func(t *testing.T) []*os.File
+		// stdin, if set, is the standard input of runsc.
+		stdin string
+		// runscArgs are global runsc flags.
+		runscArgs []string
+		// wantOutput, if set, is the whole output, without surrounding
+		// white space.
+		wantOutput string
+		// wantErr, if set, is text the failed run's stderr must contain.
+		wantErr string
+		// check inspects hostDir after the run.
+		check func(t *testing.T, hostDir string)
+	}{
+		{
+			name: "TmpfsRoot",
+			bwrapArgs: append(tmpfsRoot,
+				"--file", "3", "/etc/x",
+				"--",
+				"/bin/sh", "-c", "stat -c '%a %u %F' /etc /etc/x && cat /etc/x && echo more >> /etc/x && cat /etc/x",
+			),
+			wantOutput: fmt.Sprintf("755 %d directory\n666 %d regular file\ndata\ndata\nmore", os.Getuid(), os.Getuid()),
+		},
+		{
+			// The command gets an empty standard input once --file has read
+			// it.
+			name: "StandardInput",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "0", "/mnt/x",
+				"--",
+				"/bin/sh", "-c", "cat /mnt/x; stat -L -c %F /proc/self/fd/0",
+			},
+			fds:        func(t *testing.T) []*os.File { return nil },
+			stdin:      "data\n",
+			wantOutput: "data\ncharacter special file",
+		},
+		{
+			name: "Perms",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--perms", "0640", "--file", "3", "/mnt/a/b/x",
+				"--",
+				"/bin/sh", "-c", "stat -c '%a %n' /mnt/a /mnt/a/b /mnt/a/b/x",
+			},
+			wantOutput: "750 /mnt/a\n750 /mnt/a/b\n640 /mnt/a/b/x",
+		},
+		{
+			name: "EmptyData",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/sh", "-c", "stat -c '%a %s' /mnt/x",
+			},
+			fds:        func(t *testing.T) []*os.File { return []*os.File{dataPipe(t, nil)} },
+			wantOutput: "666 0",
+		},
+		{
+			name: "RenameAndUnlink",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/sh", "-c", "mv /mnt/x /mnt/y && cat /mnt/y && rm /mnt/y && test ! -e /mnt/y && echo ok",
+			},
+			wantOutput: "data\nok",
+		},
+		{
+			name: "LargeData",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/sh", "-c", "sha256sum < /mnt/x",
+			},
+			fds:        func(t *testing.T) []*os.File { return []*os.File{dataPipe(t, big)} },
+			wantOutput: bigSum,
+		},
+		{
+			name: "MultipleFiles",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "4", "/mnt/x",
+				"--file", "3", "/mnt/y",
+				"--",
+				"/bin/sh", "-c", "cat /mnt/x /mnt/y",
+			},
+			fds: func(t *testing.T) []*os.File {
+				return []*os.File{dataPipe(t, []byte("three\n")), dataPipe(t, []byte("four\n"))}
+			},
+			wantOutput: "four\nthree",
+		},
+		{
+			// The init process of the sandbox does not keep the descriptor.
+			name: "DescriptorNotVisible",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/ls", "/proc/1/fd",
+			},
+			wantOutput: "0\n1\n2",
+		},
+		{
+			name: "NonRootUser",
+			bwrapArgs: []string{
+				"--unshare-user", "--uid", "1000", "--gid", "1000",
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/a/x",
+				"--",
+				"/bin/sh", "-c", "stat -c '%a %u %g %n' /mnt/a /mnt/a/x && echo more >> /mnt/a/x && cat /mnt/a/x",
+			},
+			wantOutput: "755 1000 1000 /mnt/a\n666 1000 1000 /mnt/a/x\ndata\nmore",
+		},
+		{
+			// The working directory does not change the owner of the
+			// parents of the file.
+			name: "NonRootUserWorkingDirectory",
+			bwrapArgs: []string{
+				"--unshare-user", "--uid", "1000", "--gid", "1000",
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/a/x",
+				"--chdir", "/mnt/a",
+				"--",
+				"/bin/sh", "-c", "stat -c '%a %u %n' . x",
+			},
+			wantOutput: "755 1000 .\n666 1000 x",
+		},
+		{
+			// The file is created with the capabilities of the command, so
+			// without CAP_DAC_OVERRIDE root cannot write to a 0555 tmpfs.
+			name: "CapabilitiesOfCommand",
+			bwrapArgs: []string{
+				"--cap-drop", "ALL",
+				"--ro-bind", "/", "/",
+				"--perms", "0555", "--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			wantErr: `creating file "/mnt/x" from fd 3: permission denied`,
+		},
+		{
+			name: "WritableBind",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--bind", hostDir, "/mnt",
+				"--file", "3", "/mnt/new/x",
+				"--",
+				"/bin/true",
+			},
+			check: func(t *testing.T, hostDir string) {
+				checkHostFile(t, filepath.Join(hostDir, "new", "x"), "data\n", 0666)
+			},
+		},
+		{
+			name: "ExistingFileInWritableBind",
+			setup: func(t *testing.T, hostDir string) {
+				writeHostFile(t, filepath.Join(hostDir, "x"), "old longer data\n", 0600)
+			},
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--bind", hostDir, "/mnt",
+				"--perms", "0644", "--file", "3", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			check: func(t *testing.T, hostDir string) {
+				checkHostFile(t, filepath.Join(hostDir, "x"), "data\n", 0600)
+			},
+		},
+		{
+			name: "SymlinkInWritableBind",
+			setup: func(t *testing.T, hostDir string) {
+				writeHostFile(t, filepath.Join(hostDir, "target"), "target\n", 0644)
+				if err := os.Symlink("target", filepath.Join(hostDir, "x")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--bind", hostDir, "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "too many symbolic links",
+			check: func(t *testing.T, hostDir string) {
+				checkHostFile(t, filepath.Join(hostDir, "target"), "target\n", 0644)
+			},
+		},
+		{
+			// A named pipe at DEST fails at once rather than blocking.
+			name: "NamedPipeInWritableBind",
+			setup: func(t *testing.T, hostDir string) {
+				if err := unix.Mkfifo(filepath.Join(hostDir, "x"), 0666); err != nil {
+					t.Fatal(err)
+				}
+			},
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--bind", hostDir, "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			wantErr: `creating file "/mnt/x" from fd 3: a file that is not a regular file is already there`,
+		},
+		{
+			// Truncation clears the set-user-ID and set-group-ID bits, even
+			// when no data follows.
+			name: "ExistingSetIDFileInWritableBind",
+			setup: func(t *testing.T, hostDir string) {
+				path := filepath.Join(hostDir, "x")
+				writeHostFile(t, path, "old data\n", 0755)
+				if err := unix.Chmod(path, unix.S_ISUID|unix.S_ISGID|0755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--bind", hostDir, "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			fds: func(t *testing.T) []*os.File { return []*os.File{dataPipe(t, nil)} },
+			check: func(t *testing.T, hostDir string) {
+				path := filepath.Join(hostDir, "x")
+				checkHostFile(t, path, "", 0755)
+				var st unix.Stat_t
+				if err := unix.Stat(path, &st); err != nil {
+					t.Fatal(err)
+				}
+				if st.Mode&(unix.S_ISUID|unix.S_ISGID) != 0 {
+					t.Errorf("host file %s has mode %#o, want no set-user-ID or set-group-ID bit", path, st.Mode&07777)
+				}
+			},
+		},
+		{
+			name: "Device",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--file", "3", "/dev/null",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "not a regular file",
+		},
+		{
+			name: "ReadOnlyBind",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--ro-bind", hostDir, "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "read-only file system",
+			check: func(t *testing.T, hostDir string) {
+				if _, err := os.Lstat(filepath.Join(hostDir, "x")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("host file x: %v, want %v", err, os.ErrNotExist)
+				}
+			},
+		},
+		{
+			name: "ExistingFileInReadOnlyMount",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--file", "3", "/etc/hostname",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "read-only file system",
+		},
+		{
+			name: "Directory",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "is a directory",
+		},
+		{
+			name: "ClosedDescriptor",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "5", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "Can't read data for file /mnt/x: bad file descriptor",
+		},
+		{
+			name: "WriteOnlyDescriptor",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			fds: func(t *testing.T) []*os.File {
+				f, err := os.OpenFile(filepath.Join(t.TempDir(), "w"), os.O_WRONLY|os.O_CREATE, 0600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return []*os.File{f}
+			},
+			wantErr: "Can't read data for file /mnt/x: bad file descriptor",
+		},
+		{
+			name: "SameDescriptorTwice",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--file", "3", "/mnt/y",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "Can't read data for file /mnt/y: bad file descriptor",
+		},
+		{
+			name: "HiddenByLaterTmpfs",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--tmpfs", "/mnt",
+				"--",
+				"/bin/sh", "-c", "test ! -e /mnt/x && echo ok",
+			},
+			wantOutput: "ok",
+		},
+		{
+			name: "HiddenUnderBind",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--bind", hostDir, "/mnt",
+				"--file", "3", "/mnt/x",
+				"--tmpfs", "/mnt",
+				"--",
+				"/bin/sh", "-c", "test ! -e /mnt/x && echo ok",
+			},
+			wantOutput: "ok",
+			check: func(t *testing.T, hostDir string) {
+				if _, err := os.Lstat(filepath.Join(hostDir, "x")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("host file x: %v, want %v", err, os.ErrNotExist)
+				}
+			},
+		},
+		{
+			// runsc's own descriptors, which the Go runtime and the logs
+			// open, do not count as passed ones.
+			name: "NoDescriptorPassed",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			fds:     func(t *testing.T) []*os.File { return nil },
+			wantErr: "Can't read data for file /mnt/x: bad file descriptor",
+		},
+		{
+			name: "NextDescriptorNotPassed",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "4", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "Can't read data for file /mnt/x: bad file descriptor",
+		},
+		{
+			// A descriptor that a global runsc flag gives runsc is not
+			// available to --file.
+			name: "RunscLogFD",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--",
+				"/bin/true",
+			},
+			runscArgs: []string{"--log-fd=3"},
+			fds: func(t *testing.T) []*os.File {
+				f, err := os.CreateTemp(t.TempDir(), "log")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return []*os.File{f}
+			},
+			wantErr: "Can't read data for file /mnt/x: runsc uses fd 3 for --log-fd",
+		},
+		{
+			// A bad descriptor fails before --dir changes the host.
+			name: "BadDescriptorLeavesHost",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--bind", hostDir, "/mnt",
+				"--file", "9", "/mnt/x",
+				"--dir", "/mnt/d",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "Can't read data for file /mnt/x: bad file descriptor",
+			check: func(t *testing.T, hostDir string) {
+				if _, err := os.Lstat(filepath.Join(hostDir, "d")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("host directory d: %v, want %v", err, os.ErrNotExist)
+				}
+			},
+		},
+		{
+			name: "TmpfsBelowFile",
+			bwrapArgs: []string{
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--file", "3", "/mnt/x",
+				"--tmpfs", "/mnt/x/y",
+				"--",
+				"/bin/true",
+			},
+			wantErr: "Can't mount on /mnt/x/y: --file /mnt/x is not a directory",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runRootDir := newRunRootDir(t)
+			// Under sudo, the sandbox user that SUDO_UID maps to must be able
+			// to enter the directory.
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.setup != nil {
+				tc.setup(t, dir)
+			}
+
+			args := append([]string{"--root", runRootDir}, tc.runscArgs...)
+			args = append(args, "bwrap")
+			for _, arg := range tc.bwrapArgs {
+				if arg == hostDir {
+					arg = dir
+				}
+				args = append(args, arg)
+			}
+			cmd := exec.Command(specutils.ExePath, args...)
+			if tc.fds != nil {
+				cmd.ExtraFiles = tc.fds(t)
+			} else {
+				cmd.ExtraFiles = []*os.File{dataPipe(t, []byte("data\n"))}
+			}
+			defer func() {
+				for _, f := range cmd.ExtraFiles {
+					f.Close()
+				}
+			}()
+
+			if tc.stdin != "" {
+				cmd.Stdin = strings.NewReader(tc.stdin)
+			}
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			// The mode of a new file does not depend on the umask of runsc.
+			oldMask := unix.Umask(077)
+			err := testutil.RunCmd(cmd)
+			unix.Umask(oldMask)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("runsc bwrap succeeded, want failure with %q\nStdout: %s", tc.wantErr, stdout.String())
+				}
+				if !strings.Contains(stderr.String(), tc.wantErr) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("runsc bwrap failed: %v\nStderr: %s", err, stderr.String())
+			}
+
+			if output := strings.TrimSpace(stdout.String()); tc.wantOutput != "" && output != tc.wantOutput {
+				t.Errorf("output = %q, want %q", output, tc.wantOutput)
+			}
+			if tc.check != nil {
+				tc.check(t, dir)
+			}
+		})
+	}
+}
+
+// writeHostFile creates path with data and mode, whatever the umask.
+func writeHostFile(t *testing.T, path, data string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(data), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// checkHostFile checks that path is a regular file with data and mode.
+func checkHostFile(t *testing.T, path, data string, mode os.FileMode) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Errorf("host file %s: %v", path, err)
+		return
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != mode {
+		t.Errorf("host file %s is %v, want a regular file with mode %v", path, info.Mode(), mode)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != data {
+		t.Errorf("host file %s holds %q, want %q", path, got, data)
 	}
 }

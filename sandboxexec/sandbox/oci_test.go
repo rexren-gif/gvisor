@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/sandboxexec/sandbox"
 )
 
@@ -209,5 +210,40 @@ func TestSpecMountMode(t *testing.T) {
 				t.Errorf("mount options = %v, want it to contain %q", opts, tc.wantOpt)
 			}
 		})
+	}
+}
+
+func TestSpecSymlinks(t *testing.T) {
+	spec, err := sandbox.DebugSpec(sandbox.WithSymlinks(
+		sandbox.Symlink{Target: "/run", Path: "/var/run"},
+		sandbox.Symlink{Target: "usr/lib", Path: "lib/"},
+	))
+	if err != nil {
+		t.Fatalf("DebugSpec failed: %v", err)
+	}
+	got, err := specutils.Symlinks(spec)
+	if err != nil {
+		t.Fatalf("specutils.Symlinks failed: %v", err)
+	}
+	want := []specutils.Symlink{
+		{Target: "/run", Path: "/var/run"},
+		{Target: "usr/lib", Path: "/lib"},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("symlinks = %+v, want %+v", got, want)
+	}
+
+	spec, err = sandbox.DebugSpec()
+	if err != nil {
+		t.Fatalf("DebugSpec failed: %v", err)
+	}
+	if _, ok := spec.Annotations[specutils.AnnotationSymlinks]; ok {
+		t.Errorf("spec without symlinks has annotation %s", specutils.AnnotationSymlinks)
+	}
+
+	for _, link := range []sandbox.Symlink{{Path: "/l"}, {Target: "x"}, {Target: "x", Path: "/"}, {Target: "x", Path: "/a/../b"}} {
+		if _, err := sandbox.DebugSpec(sandbox.WithSymlinks(link)); err == nil {
+			t.Errorf("DebugSpec(WithSymlinks(%+v)) succeeded, want error", link)
+		}
 	}
 }

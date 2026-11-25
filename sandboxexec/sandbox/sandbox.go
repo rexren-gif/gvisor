@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +77,7 @@ type Options struct {
 	rootReadonly bool
 	user         *specs.User
 	capabilities *specs.LinuxCapabilities
+	symlinks     []Symlink
 
 	// Namespaces and ID mappings.
 	namespaces            []specs.LinuxNamespace
@@ -181,6 +183,47 @@ func WithMount(mounts ...Mount) Option {
 func WithHostname(hostname string) Option {
 	return func(o *Options) {
 		o.hostname = hostname
+	}
+}
+
+// Symlink is a symbolic link in the sandbox filesystem.
+type Symlink struct {
+	// Target is the content of the symlink. It is stored as it is, so a
+	// relative Target is relative to the directory that holds Path.
+	Target string
+
+	// Path is where the symlink is in the sandbox. A relative Path is
+	// resolved from the root directory "/". Path must not have a ".."
+	// component.
+	Path string
+}
+
+// WithSymlinks adds symlinks to the sandbox filesystem. The sandbox creates
+// them in the order provided, after all of its mounts and its working
+// directory, with the user of its init process and the capabilities that it
+// keeps after execve(2). The sandbox's seccomp filter does not apply to them.
+// Missing parent directories are created with mode 0700. A symlink that
+// already exists with the same target is left as it is. Any other file at
+// Path, including the working directory or one of its parents, makes the
+// sandbox fail to start.
+func WithSymlinks(links ...Symlink) Option {
+	return func(o *Options) {
+		for _, link := range links {
+			if link.Target == "" || link.Path == "" {
+				o.err = fmt.Errorf("symlink target and path cannot be empty: %+v", link)
+				return
+			}
+			if slices.Contains(strings.Split(link.Path, "/"), "..") {
+				o.err = fmt.Errorf("symlink path cannot have a \"..\" component: %+v", link)
+				return
+			}
+			link.Path = filepath.Join("/", link.Path)
+			if link.Path == "/" {
+				o.err = fmt.Errorf("symlink path cannot be the root directory: %+v", link)
+				return
+			}
+			o.symlinks = append(o.symlinks, link)
+		}
 	}
 }
 
@@ -389,6 +432,7 @@ func (o *Options) toBundleConfig(annotations map[string]string) bundleConfig {
 		RootReadonly: o.rootReadonly,
 		User:         o.user,
 		Capabilities: o.capabilities,
+		Symlinks:     o.symlinks,
 
 		Namespaces:            o.namespaces,
 		SkipDefaultNamespaces: o.skipDefaultNamespaces,

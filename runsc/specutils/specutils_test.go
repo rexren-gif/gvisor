@@ -534,6 +534,19 @@ func TestSpecInvalid(t *testing.T) {
 			error: "annotation dev.gvisor.dmi.product-name must not be empty",
 		},
 		{
+			name: "relative symlink path",
+			spec: specs.Spec{
+				Root: &specs.Root{Path: "/"},
+				Process: &specs.Process{
+					Args: []string{"/bin/true"},
+				},
+				Annotations: map[string]string{
+					AnnotationSymlinks: `[{"target": "/run", "path": "var/run"}]`,
+				},
+			},
+			error: "is not absolute",
+		},
+		{
 			name: "sandbox spec",
 			spec: specs.Spec{
 				Hostname: "pod",
@@ -1000,6 +1013,128 @@ func TestProductName(t *testing.T) {
 	}
 	if got, err := ProductName(nil); got != "" || err != nil {
 		t.Errorf("ProductName(nil) = %q, %v, want \"\", nil", got, err)
+	}
+}
+
+func TestSymlinks(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		want        []Symlink
+		wantErr     string
+	}{
+		{
+			name: "unset",
+		},
+		{
+			name:        "set",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "/run", "path": "/var/run"}, {"target": "../x", "path": "/a//b/"}]`},
+			want:        []Symlink{{Target: "/run", Path: "/var/run"}, {Target: "../x", Path: "/a/b"}},
+		},
+		{
+			name:        "empty array",
+			annotations: map[string]string{AnnotationSymlinks: `[]`},
+			want:        []Symlink{},
+		},
+		{
+			name:        "not JSON",
+			annotations: map[string]string{AnnotationSymlinks: `/run:/var/run`},
+			wantErr:     "invalid character",
+		},
+		{
+			name:        "unknown field",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "/run", "path": "/var/run", "mode": 1}]`},
+			wantErr:     "unknown field",
+		},
+		{
+			name:        "trailing data",
+			annotations: map[string]string{AnnotationSymlinks: `[] []`},
+			wantErr:     "unexpected data",
+		},
+		{
+			name:        "trailing bracket",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "x", "path": "/a"}]]`},
+			wantErr:     "unexpected data",
+		},
+		{
+			name:        "trailing brace",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "x", "path": "/a"}]}`},
+			wantErr:     "unexpected data",
+		},
+		{
+			name:        "empty target",
+			annotations: map[string]string{AnnotationSymlinks: `[{"path": "/var/run"}]`},
+			wantErr:     "empty target",
+		},
+		{
+			name:        "relative path",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "/run", "path": "var/run"}]`},
+			wantErr:     "not absolute",
+		},
+		{
+			name:        "NUL",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "/r\u0000un", "path": "/var/run"}]`},
+			wantErr:     "NUL byte",
+		},
+		{
+			name:        "null",
+			annotations: map[string]string{AnnotationSymlinks: `null`},
+			wantErr:     "not a JSON array",
+		},
+		{
+			name:        "null entry",
+			annotations: map[string]string{AnnotationSymlinks: `[null]`},
+			wantErr:     "empty target",
+		},
+		{
+			name:        "root path",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "x", "path": "//"}]`},
+			wantErr:     "root directory",
+		},
+		{
+			name:        "dot-dot path",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "x", "path": "/a/../b"}]`},
+			wantErr:     `".." component`,
+		},
+		{
+			name:        "NUL in path",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "/run", "path": "/var/r\u0000un"}]`},
+			wantErr:     "NUL byte",
+		},
+		{
+			name:        "path too long",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "x", "path": "/` + strings.Repeat("x", 4095) + `"}]`},
+			wantErr:     "too long",
+		},
+		{
+			name:        "longest target",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "` + strings.Repeat("x", 4095) + `", "path": "/l"}]`},
+			want:        []Symlink{{Target: strings.Repeat("x", 4095), Path: "/l"}},
+		},
+		{
+			name:        "too long",
+			annotations: map[string]string{AnnotationSymlinks: `[{"target": "` + strings.Repeat("x", 4096) + `", "path": "/var/run"}]`},
+			wantErr:     "too long",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Symlinks(&specs.Spec{Annotations: tc.annotations})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Symlinks() error = %v, want error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Symlinks() failed: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Symlinks() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+	if got, err := Symlinks(nil); got != nil || err != nil {
+		t.Errorf("Symlinks(nil) = %+v, %v, want nil, nil", got, err)
 	}
 }
 

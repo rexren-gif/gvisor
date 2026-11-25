@@ -62,6 +62,7 @@ const (
 	flagDir           = "dir"
 	flagAsPID1        = "as-pid-1"
 	flagDev           = "dev"
+	flagSymlink       = "symlink"
 )
 
 // Cli implements subcommands.Command for the "bwrap" command.
@@ -94,6 +95,7 @@ type Cli struct {
 	dir           string
 	asPID1        bool
 	dev           string
+	symlink       string
 }
 
 // Name implements subcommands.Command.Name.
@@ -140,6 +142,7 @@ func (c *Cli) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.dir, flagDir, "", "Create dir at DEST")
 	f.BoolVar(&c.asPID1, flagAsPID1, false, "Do not install a reaper process with PID=1")
 	f.StringVar(&c.dev, flagDev, "", "Mount new dev on DEST")
+	f.StringVar(&c.symlink, flagSymlink, "", "Create a symbolic link at DEST with content TARGET (takes TARGET DEST)")
 
 	// Override the default usage function to print the custom usage message.
 	f.Usage = func() {
@@ -237,6 +240,8 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 			i, err = cfg.parseAsPID1(bwrapArgs, i)
 		case flagDev:
 			i, err = cfg.parseDev(bwrapArgs, i)
+		case flagSymlink:
+			i, err = cfg.parseSymlink(bwrapArgs, i)
 		default:
 			return nil, fmt.Errorf("bwrap: Unknown option: %s", arg)
 		}
@@ -292,7 +297,7 @@ func (c *bwrapConfig) parseBind(args []string, i int) (int, error) {
 	if err != nil {
 		return i, err
 	}
-	c.Mounts = append(c.Mounts, mnt)
+	c.addMounts(mnt)
 	return i + 3, nil
 }
 
@@ -304,7 +309,7 @@ func (c *bwrapConfig) parseRoBind(args []string, i int) (int, error) {
 	if err != nil {
 		return i, err
 	}
-	c.Mounts = append(c.Mounts, mnt)
+	c.addMounts(mnt)
 	return i + 3, nil
 }
 
@@ -317,17 +322,21 @@ func (c *bwrapConfig) parseTmpfs(args []string, i int) (int, error) {
 		return i, err
 	}
 	mnt.Mode = c.takePerms()
-	c.Mounts = append(c.Mounts, mnt)
+	c.addMounts(mnt)
 	return i + 2, nil
 }
 
-// parseDir handles --dir DEST. It is a no-op
-// when DEST exists, otherwise a mkdir in whatever filesystem holds DEST. When
-// a bind mount declared before --dir covers DEST, that filesystem is on the
-// host, so do() applies the same rules to the host path. Otherwise DEST lives
-// in a sandbox filesystem that runsc cannot reach before the sandbox starts.
-// DEST already exists there if an earlier mount sits at or below it, so --dir
-// does nothing. If not, an empty tmpfs mounted at DEST stands in for the
+// parseDir handles --dir DEST. It is a no-op when DEST exists, otherwise a
+// mkdir in whatever filesystem holds DEST. The parent directories of DEST go
+// through the earlier --symlink entries first, and DEST must not be one of
+// them. If an earlier --symlink is below DEST, DEST already exists, because
+// the sandbox creates the parents of that symlink. Then --dir does nothing.
+// When a bind
+// mount declared before --dir covers DEST, that filesystem is on the host, so
+// do() applies the same rules to the host path. Otherwise DEST lives in a
+// sandbox filesystem that runsc cannot reach before the sandbox starts. DEST
+// already exists there if an earlier mount sits at or below it, so --dir does
+// nothing. If not, an empty tmpfs mounted at DEST stands in for the
 // directory.
 func (c *bwrapConfig) parseDir(args []string, i int) (int, error) {
 	if i+1 >= len(args) {
@@ -335,6 +344,18 @@ func (c *bwrapConfig) parseDir(args []string, i int) (int, error) {
 	}
 	dst := args[i+1]
 	perms := c.takePerms()
+	if dst != "" {
+		var err error
+		if dst, err = c.resolvePath(dst, false /* followLast */); err != nil {
+			return i, err
+		}
+		if _, ok := c.symlinkTarget(dst); ok {
+			return i, fmt.Errorf("bwrap: Can't mkdir %s: it is a --%s", dst, flagSymlink)
+		}
+		if c.hasSymlinkAtOrBelow(dst) {
+			return i + 2, nil
+		}
+	}
 	if bind, hostPath, ok := c.hostPath(dst); ok {
 		dir := HostDir{Dest: dst, Path: hostPath, ReadOnly: bind.ReadOnly, Perms: defaultDirPerms}
 		if perms != nil {
@@ -351,7 +372,7 @@ func (c *bwrapConfig) parseDir(args []string, i int) (int, error) {
 		return i, err
 	}
 	mnt.Mode = perms
-	c.Mounts = append(c.Mounts, mnt)
+	c.addMounts(mnt)
 	return i + 2, nil
 }
 
@@ -441,9 +462,13 @@ func (c *bwrapConfig) parseProc(args []string, i int) (int, error) {
 		return i, fmt.Errorf("--%s takes 1 argument", flagProc)
 	}
 
-	dst := filepath.Clean(args[i+1])
+	dst, err := c.mountDest(args[i+1])
+	if err != nil {
+		return i, err
+	}
 	for _, m := range c.Mounts {
 		if m.Type == sandbox.MountTypeProc && m.Destination == dst {
+			c.hideSymlinks(dst)
 			return i + 2, nil
 		}
 	}
@@ -451,7 +476,7 @@ func (c *bwrapConfig) parseProc(args []string, i int) (int, error) {
 	if err != nil {
 		return i, err
 	}
-	c.Mounts = append(c.Mounts, mnt)
+	c.addMounts(mnt)
 
 	return i + 2, nil
 }
@@ -464,9 +489,13 @@ func (c *bwrapConfig) parseDev(args []string, i int) (int, error) {
 		return i, fmt.Errorf("bwrap: --%s takes 1 argument", flagDev)
 	}
 
-	dst := filepath.Clean(args[i+1])
+	dst, err := c.mountDest(args[i+1])
+	if err != nil {
+		return i, err
+	}
 	for _, m := range append(defaultMounts(), c.Mounts...) {
 		if m.Type == sandbox.MountTypeDevtmpfs && m.Destination == dst {
+			c.hideSymlinks(dst)
 			return i + 2, nil
 		}
 	}
@@ -474,13 +503,51 @@ func (c *bwrapConfig) parseDev(args []string, i int) (int, error) {
 	if err != nil {
 		return i, err
 	}
+	// The dev mount hides the symlinks below dst before pts is resolved.
+	c.addMounts(dev)
 	pts, err := c.newMount("", filepath.Join(dst, "pts"), sandbox.MountTypeDevpts, false /* readOnly */)
 	if err != nil {
 		return i, err
 	}
-	c.Mounts = append(c.Mounts, dev, pts)
+	c.addMounts(pts)
 
 	return i + 2, nil
+}
+
+// parseSymlink handles --symlink TARGET DEST. TARGET is kept as it is. DEST is
+// made absolute, and its parent directories go through the earlier --symlink
+// entries. The sandbox creates the symlinks only after all mounts (see
+// sandbox.WithSymlinks), so the mount flags apply the command-line order
+// instead: a later mount below DEST goes through the symlink, a later mount at
+// DEST fails, and a later mount above DEST hides the symlink. A second
+// --symlink at the same DEST must have the same TARGET.
+func (c *bwrapConfig) parseSymlink(args []string, i int) (int, error) {
+	if i+2 >= len(args) {
+		return i, fmt.Errorf("bwrap: --%s takes 2 arguments", flagSymlink)
+	}
+	target, dst := args[i+1], args[i+2]
+	if target == "" {
+		return i, fmt.Errorf("bwrap: --%s TARGET is empty", flagSymlink)
+	}
+	if dst == "" {
+		return i, fmt.Errorf("bwrap: destination path is empty")
+	}
+	switch filepath.Base(dst) {
+	case ".", "..":
+		return i, fmt.Errorf("bwrap: Can't create symlink at %s: it is not a new file", dst)
+	}
+	path, err := c.resolvePath(dst, false /* followLast */)
+	if err != nil {
+		return i, err
+	}
+	if path == "/" {
+		return i, fmt.Errorf("bwrap: Can't create symlink at /: the root directory is there")
+	}
+	if prev, ok := c.symlinkTarget(path); ok && prev != target {
+		return i, fmt.Errorf("bwrap: Can't create symlink at %s to %s: an earlier --%s points it to %s", path, target, flagSymlink, prev)
+	}
+	c.Symlinks = append(c.Symlinks, sandbox.Symlink{Target: target, Path: path})
+	return i + 3, nil
 }
 
 // TODO: b/518882196 - Support joining existing user namespaces.

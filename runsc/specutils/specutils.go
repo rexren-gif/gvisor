@@ -25,6 +25,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,6 +82,16 @@ const (
 	// Usage:
 	//	"dev.gvisor.dmi.product-name": "<name>"
 	AnnotationProductName = "dev.gvisor.dmi.product-name"
+
+	// AnnotationSymlinks lists symbolic links to create in the container's
+	// filesystem once all of its mounts and its working directory are in
+	// place. The value is a JSON array of Symlink objects, which runsc creates
+	// in order, with the user of the container's init process and the
+	// capabilities that it keeps after execve(2). See Symlinks.
+	//
+	// Usage:
+	//	"dev.gvisor.symlinks": "[{\"target\": \"/run\", \"path\": \"/var/run\"}]"
+	AnnotationSymlinks = "dev.gvisor.symlinks"
 
 	// annotationSeccomp indicates what seccomp rules was set to a given container.
 	//
@@ -220,6 +231,10 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config, noRootContainer bool) e
 	}
 
 	if _, err := ProductName(spec); err != nil {
+		return err
+	}
+
+	if _, err := Symlinks(spec); err != nil {
 		return err
 	}
 
@@ -1129,6 +1144,64 @@ func ProductName(spec *specs.Spec) (string, error) {
 	return name, nil
 }
 
+// Symlink is one entry of the AnnotationSymlinks annotation.
+type Symlink struct {
+	// Target is the content of the symlink. It is stored as it is, so a
+	// relative Target is relative to the directory that holds Path.
+	Target string `json:"target"`
+
+	// Path is the absolute path of the symlink in the container. It must not
+	// be "/" or have a ".." component.
+	Path string `json:"path"`
+}
+
+// Symlinks returns the symlinks that the AnnotationSymlinks annotation lists,
+// in order, with each Path made clean. It returns an error if the annotation
+// is not a JSON array of Symlink objects (null included), or if an entry has
+// an empty Target,
+// a Path that is relative, "/" or has a ".." component, a NUL byte, or a
+// field of PATH_MAX bytes or more.
+func Symlinks(spec *specs.Spec) ([]Symlink, error) {
+	if spec == nil {
+		return nil, nil
+	}
+	val, ok := spec.Annotations[AnnotationSymlinks]
+	if !ok {
+		return nil, nil
+	}
+	var links []Symlink
+	decoder := json.NewDecoder(strings.NewReader(val))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&links); err != nil {
+		return nil, fmt.Errorf("annotation %s: %w", AnnotationSymlinks, err)
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, fmt.Errorf("annotation %s: unexpected data after the JSON array", AnnotationSymlinks)
+	}
+	if links == nil {
+		return nil, fmt.Errorf("annotation %s: the value is not a JSON array", AnnotationSymlinks)
+	}
+	for i := range links {
+		link := &links[i]
+		switch {
+		case link.Target == "":
+			return nil, fmt.Errorf("annotation %s: entry %d has an empty target", AnnotationSymlinks, i)
+		case !filepath.IsAbs(link.Path):
+			return nil, fmt.Errorf("annotation %s: entry %d has a path that is not absolute: %q", AnnotationSymlinks, i, link.Path)
+		case filepath.Clean(link.Path) == "/":
+			return nil, fmt.Errorf("annotation %s: entry %d has the root directory as its path", AnnotationSymlinks, i)
+		case slices.Contains(strings.Split(link.Path, "/"), ".."):
+			return nil, fmt.Errorf("annotation %s: entry %d has a path with a \"..\" component: %q", AnnotationSymlinks, i, link.Path)
+		case strings.ContainsRune(link.Target, 0) || strings.ContainsRune(link.Path, 0):
+			return nil, fmt.Errorf("annotation %s: entry %d contains a NUL byte", AnnotationSymlinks, i)
+		case len(link.Target) >= linux.PATH_MAX || len(link.Path) >= linux.PATH_MAX:
+			return nil, fmt.Errorf("annotation %s: entry %d is too long", AnnotationSymlinks, i)
+		}
+		link.Path = filepath.Clean(link.Path)
+	}
+	return links, nil
+}
+
 // IsProcFDPath returns true if the path is a numeric procfs/devfd magic link
 // (e.g. /proc/self/fd/3, /proc/thread-self/fd/4, /dev/fd/5).
 func IsProcFDPath(path string) bool {
@@ -1222,6 +1295,7 @@ func Features() *features.Features {
 		annotations["dev.gvisor.container-name-remap."] = ""
 		annotations[AnnotationRootfsUpperTar] = ""
 		annotations[AnnotationProductName] = ""
+		annotations[AnnotationSymlinks] = ""
 		annotations["dev.gvisor.internal.seccomp."] = ""
 		annotations["dev.gvisor.internal.seccomp.cont"] = "RuntimeDefault"
 		annotations[AnnotationTPU] = ""
@@ -1240,6 +1314,7 @@ func Features() *features.Features {
 		unsafeAnnotations = append(unsafeAnnotations,
 			"dev.gvisor.container-name-remap.",
 			AnnotationRootfsUpperTar,
+			AnnotationSymlinks,
 			"dev.gvisor.internal.seccomp.",
 			AnnotationTPU,
 			AnnotationCPUFeatures,

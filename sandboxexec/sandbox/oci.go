@@ -17,11 +17,13 @@ package sandbox
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // defaultInitArgs is the placeholder init that keeps the sandbox alive for
@@ -59,6 +61,9 @@ type bundleConfig struct {
 	// Capabilities is the capability set of the init process. When nil, the
 	// runtime applies its own default.
 	Capabilities *specs.LinuxCapabilities
+
+	// Symlinks are created in the container filesystem after its mounts.
+	Symlinks []Symlink
 
 	// Namespaces are appended to the namespace set.
 	Namespaces []specs.LinuxNamespace
@@ -171,9 +176,29 @@ func newSpec(cfg bundleConfig) (*specs.Spec, error) {
 		user = *cfg.User
 	}
 
+	annotations := cfg.Annotations
+	if len(cfg.Symlinks) > 0 {
+		if _, ok := annotations[specutils.AnnotationSymlinks]; ok {
+			return nil, fmt.Errorf("annotation %s is set, and so are symlinks", specutils.AnnotationSymlinks)
+		}
+		links := make([]specutils.Symlink, 0, len(cfg.Symlinks))
+		for _, link := range cfg.Symlinks {
+			links = append(links, specutils.Symlink(link))
+		}
+		val, err := json.Marshal(links)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode symlinks: %w", err)
+		}
+		annotations = maps.Clone(annotations)
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+		annotations[specutils.AnnotationSymlinks] = string(val)
+	}
+
 	spec := &specs.Spec{
 		Version:     "1.0.0",
-		Annotations: cfg.Annotations,
+		Annotations: annotations,
 		Root: &specs.Root{
 			Path:     rootPath,
 			Readonly: cfg.RootReadonly,

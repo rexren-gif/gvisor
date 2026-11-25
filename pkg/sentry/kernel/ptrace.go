@@ -116,6 +116,15 @@ func (t *Task) CanTrace(target *Task, attach bool) bool {
 	return t.canTraceWithMM(target, attach, targetMM, targetUserDumpable)
 }
 
+// DenyPtraceAttach prevents tasks in other thread groups from accessing tg in
+// ptrace attach mode, whatever their credentials and capabilities. This
+// includes PTRACE_ATTACH, PTRACE_SEIZE, opening /proc/[pid]/mem,
+// process_vm_readv(2), process_vm_writev(2) and pidfd_getfd(2). It cannot be
+// undone, and it does not detach a tracer that is already attached.
+func (tg *ThreadGroup) DenyPtraceAttach() {
+	tg.noPtraceAttach.Store(true)
+}
+
 // memoryManagerAndUserDumpable returns t's MemoryManager and, for use when it
 // is nil, the dumpability it had when it was released.
 func (t *Task) memoryManagerAndUserDumpable() (*mm.MemoryManager, bool) {
@@ -141,6 +150,10 @@ func (t *Task) canTraceWithMM(target *Task, attach bool, targetMM *mm.MemoryMana
 	// the same ->mm."
 	if t.tg == target.tg {
 		return true
+	}
+
+	if attach && target.tg.noPtraceAttach.Load() {
+		return false
 	}
 
 	if !t.canTraceStandardWithMM(target, attach, targetMM, targetUserDumpable) {
@@ -192,6 +205,10 @@ func (t *Task) CanTraceAndGetMM(target *Task, attach bool) (*mm.MemoryManager, e
 func (t *Task) canTraceLocked(target *Task, attach bool) bool {
 	if t.tg == target.tg {
 		return true
+	}
+
+	if attach && target.tg.noPtraceAttach.Load() {
+		return false
 	}
 
 	if !t.canTraceStandard(target, attach) {

@@ -441,6 +441,7 @@ go_test(
         "kernel_restore_test.go",
         "pending_signals_test.go",
         "seccomp_cache_test.go",
+        "seccomp_test.go",
         "table_test.go",
         "task_signals_test.go",
         "task_syscall_benchmark_test.go",

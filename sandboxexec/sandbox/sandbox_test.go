@@ -18,9 +18,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/sandboxexec/sandbox"
 )
@@ -495,5 +499,169 @@ func TestExecNewPIDNamespace(t *testing.T) {
 	// The sandbox keeps running after the command exits, so Exec still works.
 	if got := strings.TrimSpace(execOutput(ctx, t, sb, argv...)); got == "1" {
 		t.Errorf("command without WithExecNewPIDNamespace ran as PID 1")
+	}
+}
+
+// seccompDenyFilter returns a seccomp filter that fails the system calls
+// sysnos with EPERM and allows all other system calls of the host
+// architecture.
+func seccompDenyFilter(auditArch uint32, sysnos []uint32) []byte {
+	insns := []bpf.Instruction{
+		bpf.Stmt(bpf.Ld|bpf.W|bpf.Abs, 4), // seccomp_data.arch
+		bpf.Jump(bpf.Jmp|bpf.Jeq|bpf.K, auditArch, 1, 0),
+		bpf.Stmt(bpf.Ret|bpf.K, uint32(linux.SECCOMP_RET_KILL_PROCESS)),
+		bpf.Stmt(bpf.Ld|bpf.W|bpf.Abs, 0), // seccomp_data.nr
+	}
+	for i, sysno := range sysnos {
+		insns = append(insns, bpf.Jump(bpf.Jmp|bpf.Jeq|bpf.K, sysno, uint8(len(sysnos)-i), 0))
+	}
+	insns = append(insns,
+		bpf.Stmt(bpf.Ret|bpf.K, uint32(linux.SECCOMP_RET_ALLOW)),
+		bpf.Stmt(bpf.Ret|bpf.K, uint32(linux.SECCOMP_RET_ERRNO.WithReturnCode(1 /* EPERM */))),
+	)
+	return bpf.ToBytecode(insns)
+}
+
+// TestExecSeccompFilters checks that WithExecSeccompFilters installs every
+// filter on the command and its children, and that the sandbox runs other
+// commands without them.
+func TestExecSeccompFilters(t *testing.T) {
+	var auditArch uint32
+	var mkdir, chdir []uint32
+	switch runtime.GOARCH {
+	case "amd64":
+		// mkdir is 83 and mkdirat is 258. chdir is 80.
+		auditArch, mkdir, chdir = linux.AUDIT_ARCH_X86_64, []uint32{83, 258}, []uint32{80}
+	case "arm64":
+		// mkdirat is 34. chdir is 49.
+		auditArch, mkdir, chdir = linux.AUDIT_ARCH_AARCH64, []uint32{34}, []uint32{49}
+	default:
+		t.Skipf("no system call numbers for %s", runtime.GOARCH)
+	}
+
+	ctx := context.Background()
+	sb, err := sandbox.New(ctx, sandbox.WithNetwork(sandbox.NetworkModeNone))
+	if err != nil {
+		t.Fatalf("failed to start sandbox: %v", err)
+	}
+	defer sb.Close(ctx)
+
+	fdsBefore, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("failed to read /proc/self/fd: %v", err)
+	}
+	argv := []string{"/bin/sh", "-c", `mkdir /tmp/seccomp; echo mkdir=$?; cd /tmp; echo cd=$?; grep -E "^(NoNewPrivs|Seccomp):" /proc/self/status`}
+	res, err := sb.Exec(ctx, argv, sandbox.WithExecSeccompFilters(seccompDenyFilter(auditArch, mkdir), seccompDenyFilter(auditArch, chdir)))
+	if err != nil {
+		t.Fatalf("failed to execute %v in sandbox: %v", argv, err)
+	}
+	for _, want := range []string{"mkdir=1", "NoNewPrivs:\t1", "Seccomp:\t2"} {
+		if !strings.Contains(res.Stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", res.Stdout, want)
+		}
+	}
+	if strings.Contains(res.Stdout, "cd=0") {
+		t.Errorf("stdout = %q, want cd to fail", res.Stdout)
+	}
+	fdsAfter, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("failed to read /proc/self/fd: %v", err)
+	}
+	if len(fdsAfter) != len(fdsBefore) {
+		t.Errorf("Exec left %d descriptors open, want %d", len(fdsAfter), len(fdsBefore))
+	}
+
+	// The next command runs without the filters.
+	out := execOutput(ctx, t, sb, argv...)
+	for _, want := range []string{"mkdir=0", "cd=0", "NoNewPrivs:\t0", "Seccomp:\t0"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout = %q, want it to contain %q", out, want)
+		}
+	}
+
+	// Exec rejects an invalid filter before the command runs.
+	if res, err := sb.Exec(ctx, []string{"/bin/echo", "ran"}, sandbox.WithExecSeccompFilters([]byte{1, 2, 3})); err == nil {
+		t.Errorf("Exec with an invalid filter = %+v, want error", res)
+	}
+}
+
+// TestExecSeccompFiltersUntraceableInit checks that an Exec with filters makes
+// the init process untraceable only if the command starts.
+func TestExecSeccompFiltersUntraceableInit(t *testing.T) {
+	ctx := context.Background()
+	// CAP_SYS_PTRACE lets commands trace the init process, which is not
+	// their parent.
+	ptraceCap := []string{"CAP_SYS_PTRACE"}
+	caps := &specs.LinuxCapabilities{Bounding: ptraceCap, Effective: ptraceCap, Permitted: ptraceCap, Inheritable: ptraceCap, Ambient: ptraceCap}
+	sb, err := sandbox.New(ctx, sandbox.WithNetwork(sandbox.NetworkModeNone), sandbox.WithCapabilities(caps))
+	if err != nil {
+		t.Fatalf("failed to start sandbox: %v", err)
+	}
+	defer sb.Close(ctx)
+
+	allow := bpf.ToBytecode([]bpf.Instruction{bpf.Stmt(bpf.Ret|bpf.K, uint32(linux.SECCOMP_RET_ALLOW))})
+	// Opening /proc/1/mem is a ptrace attach mode access to the init process.
+	openMem := []string{"/bin/sh", "-c", `( exec 3</proc/1/mem ) 2>/dev/null && echo opened || echo denied`}
+	if got := strings.TrimSpace(execOutput(ctx, t, sb, openMem...)); got != "opened" {
+		t.Fatalf("before any filter: %q, want %q", got, "opened")
+	}
+
+	// The program does not exist, so the command does not start.
+	res, err := sb.Exec(ctx, []string{"/does/not/exist"}, sandbox.WithExecSeccompFilters(allow))
+	if err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatalf("Exec of a missing program exited with 0")
+	}
+	if got := strings.TrimSpace(execOutput(ctx, t, sb, openMem...)); got != "opened" {
+		t.Errorf("after a failed Exec with filters: %q, want %q", got, "opened")
+	}
+
+	if _, err := sb.Exec(ctx, []string{"/bin/true"}, sandbox.WithExecSeccompFilters(allow)); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if got := strings.TrimSpace(execOutput(ctx, t, sb, openMem...)); got != "denied" {
+		t.Errorf("after an Exec with filters: %q, want %q", got, "denied")
+	}
+}
+
+func TestCheckSeccompFilters(t *testing.T) {
+	allow := func(n int) []byte {
+		insns := make([]bpf.Instruction, n)
+		for i := range insns {
+			insns[i] = bpf.Stmt(bpf.Ret|bpf.K, uint32(linux.SECCOMP_RET_ALLOW))
+		}
+		return bpf.ToBytecode(insns)
+	}
+	maxFilter := allow(bpf.MaxInstructions)
+	for _, tc := range []struct {
+		name        string
+		filters     [][]byte
+		errContains string
+	}{
+		{name: "None"},
+		{name: "MaxInstructions", filters: [][]byte{maxFilter}},
+		// 7 filters of 4096 instructions, plus 4 for each filter beyond the
+		// first, fit in 32768 instructions. 8 do not.
+		{name: "MaxCombinedLength", filters: [][]byte{maxFilter, maxFilter, maxFilter, maxFilter, maxFilter, maxFilter, maxFilter}},
+		{name: "CombinedLengthTooLarge", filters: [][]byte{maxFilter, maxFilter, maxFilter, maxFilter, maxFilter, maxFilter, maxFilter, maxFilter}, errContains: "in total"},
+		{name: "Empty", filters: [][]byte{maxFilter, {}}, errContains: "seccomp filter 1: filter is empty"},
+		{name: "NotMultipleOfInstructionSize", filters: [][]byte{{1, 2, 3}}, errContains: "not a multiple of 8 bytes"},
+		{name: "TooManyInstructions", filters: [][]byte{allow(bpf.MaxInstructions + 1)}, errContains: "more than 4096 instructions"},
+		{name: "NoReturn", filters: [][]byte{bpf.ToBytecode([]bpf.Instruction{bpf.Stmt(bpf.Ld|bpf.W|bpf.Abs, 0)})}, errContains: "not a valid BPF program"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sandbox.CheckSeccompFilters(tc.filters...)
+			if tc.errContains == "" {
+				if err != nil {
+					t.Errorf("CheckSeccompFilters() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("CheckSeccompFilters() = %v, want error containing %q", err, tc.errContains)
+			}
+		})
 	}
 }

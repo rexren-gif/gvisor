@@ -338,6 +338,14 @@ func (cm *containerManager) ExecuteAsync(args *control.ExecArgs, pid *int32) err
 	return nil
 }
 
+// ExecuteAsyncWithSeccomp is ExecuteAsync for a command with seccomp filters
+// or ExecArgs.UntraceableInit. The control server ignores argument fields that
+// it does not know, so a Sentry without support for these fields must not have
+// this method: the call then fails rather than run the command without them.
+func (cm *containerManager) ExecuteAsyncWithSeccomp(args *control.ExecArgs, pid *int32) error {
+	return cm.ExecuteAsync(args, pid)
+}
+
 // Checkpoint pauses a sandbox and saves its state.
 func (cm *containerManager) Checkpoint(o *controlapi.SaveOpts, _ *struct{}) error {
 	log.Debugf("containerManager.Checkpoint")

@@ -2030,6 +2030,8 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	}
 	args.SeccompFilter = seccompFilter
 
+	args.ContainerInit = tg
+
 	// Start the process.
 	proc := control.Proc{Kernel: l.k}
 	newTG, tgid, ttyFile, err := control.ExecAsync(&proc, args)

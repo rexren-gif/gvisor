@@ -155,6 +155,10 @@ type ThreadGroup struct {
 	// atomically without it.
 	signalUnkillable atomicbitops.Bool
 
+	// noPtraceAttach is true if tasks in other thread groups may not access
+	// this thread group in ptrace attach mode. See DenyPtraceAttach.
+	noPtraceAttach atomicbitops.Bool
+
 	// exiting is true if all tasks in the ThreadGroup should exit. exiting is
 	// analogous to Linux's SIGNAL_GROUP_EXIT.
 	//

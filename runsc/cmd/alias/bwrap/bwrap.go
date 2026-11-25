@@ -25,12 +25,14 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
@@ -94,6 +96,19 @@ type bwrapConfig struct {
 	AsPID1      bool
 	hasArgv0    bool
 	nextPerms   *uint32
+
+	// SeccompFD is the descriptor of the last --seccomp, or nil.
+	SeccompFD *int
+	// AddSeccompFDs are the descriptors of --add-seccomp-fd, in command-line
+	// order.
+	AddSeccompFDs []int
+	// unusedSeccompFDs are the descriptors of the --seccomp flags that a later
+	// --seccomp replaces.
+	unusedSeccompFDs []int
+	// seccompFilters hold the filters from SeccompFD or AddSeccompFDs.
+	seccompFilters [][]byte
+	// readStdio[fd] is true if a filter was read from the stdio descriptor fd.
+	readStdio [3]bool
 }
 
 // String returns a string representation of the bwrapConfig.
@@ -456,8 +471,98 @@ func mkdir(path string, perms uint32, uid, gid int) error {
 	return unix.Chmod(path, perms|st.Mode&unix.S_ISGID)
 }
 
+// maxSeccompFilterSize is the size of the largest seccomp filter:
+// bpf.MaxInstructions instructions of 8 bytes each.
+const maxSeccompFilterSize = bpf.MaxInstructions * 8
+
+// readSeccompFilters reads the filter of each --seccomp or --add-seccomp-fd
+// descriptor into c.seccompFilters. It closes every descriptor given to these
+// flags, so that the runsc processes that run the sandbox do not get them. A
+// stdio descriptor stays open for runsc, and execStdio gives /dev/null to
+// COMMAND in its place.
+func (c *bwrapConfig) readSeccompFilters() error {
+	fds := c.AddSeccompFDs
+	if c.SeccompFD != nil {
+		fds = []int{*c.SeccompFD}
+	}
+	for _, fd := range c.unusedSeccompFDs {
+		if fd > 2 && !slices.Contains(fds, fd) && util.CheckInheritedFD(fd) == nil {
+			unix.Close(fd)
+		}
+	}
+	for _, fd := range fds {
+		if fd <= 2 && c.readStdio[fd] {
+			return fmt.Errorf("bwrap: Can't read seccomp filter from fd %d: %w", fd, unix.EBADF)
+		}
+		filter, err := readSeccompFilter(fd)
+		if fd <= 2 {
+			c.readStdio[fd] = true
+		}
+		if err != nil {
+			return fmt.Errorf("bwrap: Can't read seccomp filter from fd %d: %w", fd, err)
+		}
+		if err := sandbox.CheckSeccompFilter(filter); err != nil {
+			return fmt.Errorf("bwrap: Invalid seccomp filter from fd %d: %v", fd, err)
+		}
+		c.seccompFilters = append(c.seccompFilters, filter)
+	}
+	if err := sandbox.CheckSeccompFilters(c.seccompFilters...); err != nil {
+		return fmt.Errorf("bwrap: %v", err)
+	}
+	return nil
+}
+
+// readSeccompFilter reads fd to end of file, but at most one byte more than
+// maxSeccompFilterSize. Then it closes fd unless it is a stdio descriptor.
+func readSeccompFilter(fd int) (filter []byte, err error) {
+	if err := util.CheckInheritedFD(fd); err != nil {
+		return nil, err
+	}
+	if fd > 2 {
+		defer unix.Close(fd)
+	}
+	buf := make([]byte, 4096)
+	for len(filter) <= maxSeccompFilterSize {
+		n, err := unix.Read(fd, buf[:min(len(buf), maxSeccompFilterSize+1-len(filter))])
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			break
+		}
+		filter = append(filter, buf[:n]...)
+	}
+	return filter, nil
+}
+
+// execStdio returns the stdio files of COMMAND: those of runsc, except that a
+// stdio descriptor that a filter was read from becomes /dev/null. The Sentry
+// reads a regular file from its own offset, so COMMAND would otherwise read the
+// filter again. The caller must close null if it is not nil.
+func (c *bwrapConfig) execStdio() (stdin, stdout, stderr, null *os.File, err error) {
+	stdio := []*os.File{os.Stdin, os.Stdout, os.Stderr}
+	for fd, read := range c.readStdio {
+		if !read {
+			continue
+		}
+		if null == nil {
+			if null, err = os.OpenFile(os.DevNull, os.O_RDWR, 0); err != nil {
+				return nil, nil, nil, nil, err
+			}
+		}
+		stdio[fd] = null
+	}
+	return stdio[0], stdio[1], stdio[2], null, nil
+}
+
 // do runs the command in a gVisor sandbox and records its exit status.
 func do(ctx context.Context, c *bwrapConfig, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
+	if err := c.readSeccompFilters(); err != nil {
+		return util.Errorf("%v", err)
+	}
 	opts, err := c.prepareSandbox()
 	if err != nil {
 		return util.Errorf("%v", err)
@@ -477,12 +582,22 @@ func do(ctx context.Context, c *bwrapConfig, waitStatus *unix.WaitStatus) subcom
 		}
 	}()
 
+	stdin, stdout, stderr, null, err := c.execStdio()
+	if err != nil {
+		return util.Errorf("bwrap: %v", err)
+	}
+	if null != nil {
+		defer null.Close()
+	}
 	execOpts := []sandbox.ExecOption{
-		sandbox.WithExecStdio(os.Stdin, os.Stdout, os.Stderr),
+		sandbox.WithExecStdio(stdin, stdout, stderr),
 		sandbox.WithExecSignalRelay(),
 	}
 	if c.AsPID1 {
 		execOpts = append(execOpts, sandbox.WithExecNewPIDNamespace())
+	}
+	if len(c.seccompFilters) > 0 {
+		execOpts = append(execOpts, sandbox.WithExecSeccompFilters(c.seccompFilters...))
 	}
 	argv := c.Args
 	if c.hasArgv0 {

@@ -88,6 +88,10 @@ const ContMgrDestroySubcontainer = "containerManager.DestroySubcontainer"
 // ContMgrExecuteAsync executes a command in a container.
 const ContMgrExecuteAsync = "containerManager.ExecuteAsync"
 
+// ContMgrExecuteAsyncWithSeccomp executes a command with seccomp filters, or
+// with an untraceable init process, in a container.
+const ContMgrExecuteAsyncWithSeccomp = "containerManager.ExecuteAsyncWithSeccomp"
+
 // ContMgrCheckpoint checkpoints a container.
 const ContMgrCheckpoint = "containerManager.Checkpoint"
 

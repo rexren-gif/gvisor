@@ -75,6 +75,18 @@ type ExecArgs struct {
 
 	// NewPIDNamespace runs the process as PID 1 of a new child PID namespace.
 	NewPIDNamespace bool
+
+	// SeccompFilters are seccomp filters to install on the process before it
+	// starts, in this order. Each one is a classic BPF program: an array of
+	// struct sock_filter in host byte order. The process gets the
+	// no_new_privs attribute if there is at least one filter.
+	SeccompFilters [][]byte
+
+	// UntraceableInit makes the init process of the container untraceable
+	// right before the process starts: no process in another thread group can
+	// access it in ptrace attach mode after that. This cannot be undone. Only
+	// the containerManager control methods support it.
+	UntraceableInit bool
 }
 
 // String prints the arguments as a string.

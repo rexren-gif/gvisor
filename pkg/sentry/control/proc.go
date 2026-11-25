@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
@@ -72,6 +73,11 @@ type ExecArgs struct {
 	// SeccompFilter is an optional seccomp filter to install on the new
 	// process.
 	SeccompFilter *kernel.SyscallFilter
+
+	// ContainerInit is the init process of the container. It must be set if
+	// UntraceableInit is true. execAsync makes it untraceable right before the
+	// new process starts.
+	ContainerInit *kernel.ThreadGroup `json:"-"`
 }
 
 // Exec runs a new task.
@@ -126,7 +132,7 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		WorkingDirectory:     args.WorkingDirectory,
 		MountNamespace:       args.MountNamespace,
 		Credentials:          creds,
-		NoNewPrivs:           args.NoNewPrivileges,
+		NoNewPrivs:           args.NoNewPrivileges || len(args.SeccompFilters) > 0,
 		Umask:                0022,
 		Limits:               limitSet,
 		MaxSymlinkTraversals: linux.MaxSymlinkTraversals,
@@ -173,6 +179,17 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 			_ = hostFD.Close()
 		}
 	}()
+
+	execFilters, err := compileSeccompFilters(args.SeccompFilters)
+	if err == nil && args.UntraceableInit && args.ContainerInit == nil {
+		err = fmt.Errorf("UntraceableInit requires a container")
+	}
+	if err != nil {
+		if execFD != nil {
+			_ = execFD.Close()
+		}
+		return nil, 0, nil, err
+	}
 
 	if execFD != nil {
 		if initArgs.Filename != "" {
@@ -237,17 +254,29 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		initArgs.InitialCgroups = initialCgrps
 	}
 
+	if args.SeccompFilter != nil {
+		execFilters = append([]kernel.SyscallFilter{*args.SeccompFilter}, execFilters...)
+	}
+	lengths := make([]int, 0, len(execFilters))
+	for _, f := range execFilters {
+		lengths = append(lengths, f.ProgramLength())
+	}
+	if err := kernel.CheckSyscallFiltersLength(lengths...); err != nil {
+		return nil, 0, nil, fmt.Errorf("installing seccomp filters: %w", err)
+	}
+
 	mntnsCu.Release() // mntns ref is transferred to Kernel.CreateProcess()
 	tg, tid, err := proc.Kernel.CreateProcess(initArgs)
 	if err != nil {
 		return nil, 0, nil, err
 	}
 
-	if args.SeccompFilter != nil {
-		task := tg.Leader()
-		if err := task.AppendSyscallFilter(*args.SeccompFilter, true); err != nil {
-			return nil, 0, nil, fmt.Errorf("appending seccomp filters: %w", err)
-		}
+	if err := tg.Leader().AppendSyscallFilters(execFilters, true); err != nil {
+		return nil, 0, nil, fmt.Errorf("appending seccomp filters: %w", err)
+	}
+
+	if args.UntraceableInit {
+		args.ContainerInit.DenyPtraceAttach()
 	}
 
 	// Start the newly created process.
@@ -435,4 +464,38 @@ func (proc *Proc) SignalProcess(args *SignalProcessArgs, _ *struct{}) error {
 		return fmt.Errorf("no such process with PID %d", args.PID)
 	}
 	return proc.Kernel.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(args.Signo)})
+}
+
+// compileSeccompFilters compiles the classic BPF programs of
+// controlapi.ExecArgs.SeccompFilters. Each program must hold 1 to
+// bpf.MaxInstructions struct sock_filter entries in host byte order and pass
+// the BPF checker. The programs must also fit in the combined length limit of
+// a task before optimization.
+func compileSeccompFilters(programs [][]byte) ([]kernel.SyscallFilter, error) {
+	var ins linux.BPFInstruction
+	size := ins.SizeBytes()
+	lengths := make([]int, 0, len(programs))
+	for i, program := range programs {
+		if len(program) == 0 || len(program)%size != 0 || len(program)/size > bpf.MaxInstructions {
+			return nil, fmt.Errorf("seccomp filter %d: size is %d bytes, want a multiple of %d bytes from %d to %d bytes", i, len(program), size, size, bpf.MaxInstructions*size)
+		}
+		lengths = append(lengths, len(program)/size)
+	}
+	if err := kernel.CheckSyscallFiltersLength(lengths...); err != nil {
+		return nil, fmt.Errorf("seccomp filters: %w", err)
+	}
+	filters := make([]kernel.SyscallFilter, 0, len(programs))
+	for i, program := range programs {
+		insns := make([]bpf.Instruction, 0, len(program)/size)
+		for b := program; len(b) > 0; {
+			b = ins.UnmarshalBytes(b)
+			insns = append(insns, bpf.Instruction(ins))
+		}
+		compiled, err := bpf.Compile(insns, true /* optimize */)
+		if err != nil {
+			return nil, fmt.Errorf("seccomp filter %d: invalid BPF program: %w", i, err)
+		}
+		filters = append(filters, kernel.NewSyscallFilter(compiled))
+	}
+	return filters, nil
 }

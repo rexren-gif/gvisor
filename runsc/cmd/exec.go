@@ -18,9 +18,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +30,7 @@ import (
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -73,6 +76,14 @@ type Exec struct {
 	// newPIDNS runs the process as PID 1 of a new PID namespace that is a
 	// child of the container's PID namespace.
 	newPIDNS bool
+
+	// seccompFDs are host file descriptors, each holding a seccomp filter to
+	// install on the process. See controlapi.ExecArgs.SeccompFilters.
+	seccompFDs stringSlice
+
+	// untraceableInit makes the init process of the container untraceable.
+	// See controlapi.ExecArgs.UntraceableInit.
+	untraceableInit bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -120,6 +131,8 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&ex.execFD, "exec-fd", -1, "host file descriptor used for program execution")
 	f.StringVar(&ex.execPath, "exec-path", "", "path of the program to execute; if unset, it is resolved from argv[0]. Mutually exclusive with --exec-fd")
 	f.BoolVar(&ex.newPIDNS, "new-pidns", false, "run the process as PID 1 of a new PID namespace; when it exits, all processes left in that namespace are killed")
+	f.BoolVar(&ex.untraceableInit, "untraceable-init", false, "before the process starts, make the init process of the container untraceable for good: no other process can ptrace it, open its /proc/[pid]/mem or use process_vm_readv/writev or pidfd_getfd on it")
+	f.Var(&ex.seccompFDs, "seccomp-fd", "host file descriptor to read a classic BPF seccomp filter from (struct sock_filter array in host byte order); the filter is installed on the process before it starts, along with no_new_privs (can be supplied multiple times)")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -151,6 +164,11 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("parsing process spec: %v", err)
 	}
 	e.NewPIDNamespace = ex.newPIDNS
+	e.UntraceableInit = ex.untraceableInit
+	seccompFDs, err := ex.parseSeccompFDs()
+	if err != nil {
+		util.Fatalf("%v", err)
+	}
 
 	log.Debugf("Exec arguments: %+v", e)
 	log.Debugf("Exec capabilities: %+v", e.Capabilities)
@@ -197,7 +215,17 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	// write the child's PID to the pid file. So when the container returns, the
 	// child process will also return and signal containerd.
 	if ex.detach {
-		return ex.execChildAndWait(waitStatus)
+		// The child that execChildAndWait starts inherits the seccomp
+		// filter descriptors and reads them.
+		status := ex.execChildAndWait(waitStatus)
+		for _, fd := range seccompFDs {
+			unix.Close(fd)
+		}
+		return status
+	}
+	e.SeccompFilters, err = readSeccompFilters(seccompFDs)
+	if err != nil {
+		util.Fatalf("reading seccomp filters: %v", err)
 	}
 	return ex.exec(conf, c, e, waitStatus)
 }
@@ -527,6 +555,64 @@ func (ss *stringSlice) Get() any {
 func (ss *stringSlice) Set(s string) error {
 	*ss = append(*ss, s)
 	return nil
+}
+
+// maxSeccompFilterSize is the largest seccomp filter that --seccomp-fd reads:
+// bpf.MaxInstructions instructions of 8 bytes each.
+const maxSeccompFilterSize = bpf.MaxInstructions * 8
+
+// parseSeccompFDs parses the --seccomp-fd descriptors. runsc exec closes them
+// after it reads them, so each one must be a descriptor that runsc inherited,
+// that is not a stdio descriptor, and that no other flag uses.
+func (ex *Exec) parseSeccompFDs() ([]int, error) {
+	var fds []int
+	for _, s := range ex.seccompFDs {
+		fd64, err := strconv.ParseInt(s, 10, 32)
+		if err != nil || fd64 < 0 {
+			return nil, fmt.Errorf("invalid --seccomp-fd %q", s)
+		}
+		fd := int(fd64)
+		if fd <= 2 {
+			return nil, fmt.Errorf("invalid --seccomp-fd %d: it is a stdio descriptor", fd)
+		}
+		used := slices.Contains(fds, fd) || fd == ex.execFD
+		for _, m := range ex.passFDs {
+			used = used || m.Host == fd
+		}
+		if used {
+			return nil, fmt.Errorf("invalid --seccomp-fd %d: another flag uses it", fd)
+		}
+		if err := util.CheckInheritedFD(fd); err != nil {
+			return nil, fmt.Errorf("invalid --seccomp-fd %d: %w", fd, err)
+		}
+		fds = append(fds, fd)
+	}
+	return fds, nil
+}
+
+// readSeccompFilters reads a seccomp filter from each of fds, and closes them.
+func readSeccompFilters(fds []int) ([][]byte, error) {
+	var files []*os.File
+	defer func() {
+		for _, f := range files {
+			f.Close()
+		}
+	}()
+	for _, fd := range fds {
+		files = append(files, os.NewFile(uintptr(fd), "seccomp-fd"))
+	}
+	filters := make([][]byte, 0, len(files))
+	for _, f := range files {
+		filter, err := io.ReadAll(io.LimitReader(f, maxSeccompFilterSize+1))
+		if err != nil {
+			return nil, fmt.Errorf("--seccomp-fd %d: %w", f.Fd(), err)
+		}
+		if len(filter) > maxSeccompFilterSize {
+			return nil, fmt.Errorf("--seccomp-fd %d: filter is larger than %d bytes", f.Fd(), maxSeccompFilterSize)
+		}
+		filters = append(filters, filter)
+	}
+	return filters, nil
 }
 
 // user allows -user to convey a UID and, optionally, a GID separated by a

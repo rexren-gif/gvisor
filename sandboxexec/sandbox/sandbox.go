@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +36,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sighandling"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -642,6 +644,7 @@ type execOptions struct {
 	stderr          io.Writer
 	relaySignals    bool
 	newPIDNamespace bool
+	seccompFilters  [][]byte
 }
 
 // WithExecStdio streams the command's standard streams to the given ones. A
@@ -686,6 +689,74 @@ func WithExecNewPIDNamespace() ExecOption {
 	}
 }
 
+// WithExecSeccompFilters installs seccomp filters on the command before it
+// starts, in the given order. Each filter is a classic BPF program: an array of
+// struct sock_filter in host byte order, as libseccomp's seccomp_export_bpf
+// writes it. The command also gets the no_new_privs attribute. The filters
+// apply to the command and its children, not to the sandbox itself. The init
+// process of the sandbox has no filters, so before the command starts, Exec
+// makes it untraceable for good: no process can then ptrace it, open its
+// /proc/[pid]/mem, or use process_vm_readv, process_vm_writev or pidfd_getfd
+// on it. Other processes without the filters, such as those of other Exec
+// calls, stay traceable. Exec returns an error if CheckSeccompFilters rejects
+// the filters.
+func WithExecSeccompFilters(filters ...[]byte) ExecOption {
+	return func(o *execOptions) {
+		o.seccompFilters = append(o.seccompFilters, filters...)
+	}
+}
+
+const (
+	// sockFilterSize is the size of struct sock_filter.
+	sockFilterSize = 8
+
+	// maxSeccompInstructions is the limit on the combined length of the
+	// seccomp filters of a process, in instructions. Each filter beyond the
+	// first adds 4 instructions.
+	maxSeccompInstructions = 1 << 15
+)
+
+// CheckSeccompFilter returns an error if filter is not a valid classic BPF
+// program of 1 to bpf.MaxInstructions instructions.
+func CheckSeccompFilter(filter []byte) error {
+	switch {
+	case len(filter) == 0:
+		return fmt.Errorf("filter is empty")
+	case len(filter) > bpf.MaxInstructions*sockFilterSize:
+		return fmt.Errorf("filter has more than %d instructions", bpf.MaxInstructions)
+	case len(filter)%sockFilterSize != 0:
+		return fmt.Errorf("filter size %d is not a multiple of %d bytes", len(filter), sockFilterSize)
+	}
+	insns := make([]bpf.Instruction, 0, len(filter)/sockFilterSize)
+	for b := filter; len(b) > 0; b = b[sockFilterSize:] {
+		insns = append(insns, bpf.RawInstruction(binary.NativeEndian.Uint16(b), b[2], b[3], binary.NativeEndian.Uint32(b[4:])))
+	}
+	if _, err := bpf.Compile(insns, false /* optimize */); err != nil {
+		return fmt.Errorf("filter is not a valid BPF program: %v", err)
+	}
+	return nil
+}
+
+// CheckSeccompFilters returns an error if a process cannot hold filters: if
+// CheckSeccompFilter rejects one of them, or if they go over the limit on
+// their combined length.
+func CheckSeccompFilters(filters ...[]byte) error {
+	total := 0
+	for i, filter := range filters {
+		if err := CheckSeccompFilter(filter); err != nil {
+			return fmt.Errorf("seccomp filter %d: %v", i, err)
+		}
+		total += len(filter) / sockFilterSize
+		if i > 0 {
+			total += 4
+		}
+	}
+	if total > maxSeccompInstructions {
+		return fmt.Errorf("seccomp filters have %d instructions in total, more than %d", total, maxSeccompInstructions)
+	}
+	return nil
+}
+
 // ExecResult is the outcome of a command run by Exec.
 type ExecResult struct {
 	// ExitCode is the status the command exited with, or 128 plus the signal
@@ -708,6 +779,9 @@ func (s *Sandbox) Exec(ctx context.Context, argv []string, opts ...ExecOption) (
 	options := &execOptions{args: argv}
 	for _, o := range opts {
 		o(options)
+	}
+	if err := CheckSeccompFilters(options.seccompFilters...); err != nil {
+		return nil, err
 	}
 
 	if options.relaySignals {
@@ -738,8 +812,28 @@ func (s *Sandbox) Exec(ctx context.Context, argv []string, opts ...ExecOption) (
 	if options.newPIDNamespace {
 		args = append(args, "--new-pidns")
 	}
+	if len(options.seccompFilters) > 0 {
+		// The init process is a placeholder without the filters.
+		args = append(args, "--untraceable-init")
+	}
+	var extraFiles []*os.File
+	defer func() {
+		for _, f := range extraFiles {
+			f.Close()
+		}
+	}()
+	for _, filter := range options.seccompFilters {
+		f, err := s.seccompFile(filter)
+		if err != nil {
+			return nil, err
+		}
+		// exec.Cmd gives ExtraFiles[i] descriptor 3+i in runsc.
+		args = append(args, "--seccomp-fd", strconv.Itoa(3+len(extraFiles)))
+		extraFiles = append(extraFiles, f)
+	}
 	args = append(append(args, s.id), options.args...)
 	cmd := exec.CommandContext(ctx, s.runscPath, args...)
+	cmd.ExtraFiles = extraFiles
 	cmd.Stdin = options.stdin
 	var stdout, stderr bytes.Buffer
 	if cmd.Stdout = options.stdout; cmd.Stdout == nil {
@@ -752,6 +846,11 @@ func (s *Sandbox) Exec(ctx context.Context, argv []string, opts ...ExecOption) (
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start command in sandbox: %v", err)
 	}
+	// runsc has its own copies of the seccomp filter files.
+	for _, f := range extraFiles {
+		f.Close()
+	}
+	extraFiles = nil
 	if options.relaySignals {
 		stopRelay := s.relaySignals(ctx, pidFile)
 		defer stopRelay()
@@ -772,6 +871,27 @@ func (s *Sandbox) Exec(ctx context.Context, argv []string, opts ...ExecOption) (
 		}
 	}
 	return res, nil
+}
+
+// seccompFile returns an unlinked file that holds filter, at offset 0.
+func (s *Sandbox) seccompFile(filter []byte) (*os.File, error) {
+	f, err := os.CreateTemp(s.bundleDir, "seccomp-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create seccomp filter file: %v", err)
+	}
+	if err := os.Remove(f.Name()); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to unlink seccomp filter file: %v", err)
+	}
+	if _, err := f.Write(filter); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to write seccomp filter file: %v", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to rewind seccomp filter file: %v", err)
+	}
+	return f, nil
 }
 
 // Close kills the sandbox processes and cleans up after it.

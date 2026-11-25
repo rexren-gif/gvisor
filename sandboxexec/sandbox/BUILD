@@ -19,6 +19,7 @@ go_library(
     visibility = ["//:__subpackages__"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/log",
         "//pkg/sighandling",
         "//runsc/specutils",
@@ -37,6 +38,8 @@ go_test(
     tags = ["nogotsan"],
     deps = [
         ":sandbox",
+        "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/test/testutil",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],

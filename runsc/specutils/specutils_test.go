@@ -1725,3 +1725,95 @@ func TestSafeSetupAndMountDanglingSymlink(t *testing.T) {
 		t.Errorf("os.Lstat(%q) err = %v, want %v", missing, err, os.ErrNotExist)
 	}
 }
+
+func TestOverlayLayersOf(t *testing.T) {
+	lower := func(dst string) string { return OverlayLowerOption + "=" + dst }
+	upper := func(dst string) string { return OverlayUpperOption + "=" + dst }
+	for _, tc := range []struct {
+		name       string
+		mount      specs.Mount
+		wantLayers *OverlayLayers
+		wantRest   []string
+		wantErr    string
+	}{
+		{
+			name:     "NotOverlay",
+			mount:    specs.Mount{Type: "bind", Options: []string{lower("/l")}},
+			wantRest: []string{lower("/l")},
+		},
+		{
+			name:     "OverlayWithoutLayers",
+			mount:    specs.Mount{Type: "overlay", Options: []string{"lowerdir=/a:/b"}},
+			wantRest: []string{"lowerdir=/a:/b"},
+		},
+		{
+			name:       "LowersAndUpper",
+			mount:      specs.Mount{Type: "overlay", Options: []string{"noexec", lower("/l/0"), lower("/l/1"), upper("/l/u")}},
+			wantLayers: &OverlayLayers{Lowers: []string{"/l/0", "/l/1"}, Upper: "/l/u"},
+			wantRest:   []string{"noexec"},
+		},
+		{
+			name:       "ReadOnly",
+			mount:      specs.Mount{Type: "overlay", Options: []string{"ro", lower("/l/0"), lower("/l/1")}},
+			wantLayers: &OverlayLayers{Lowers: []string{"/l/0", "/l/1"}},
+			wantRest:   []string{"ro"},
+		},
+		{
+			name:    "ReadOnlyOneLower",
+			mount:   specs.Mount{Type: "overlay", Options: []string{"ro", lower("/l/0")}},
+			wantErr: "needs 2 or more",
+		},
+		{
+			name:    "ReadOnlyUpper",
+			mount:   specs.Mount{Type: "overlay", Options: []string{"ro", lower("/l/0"), lower("/l/1"), upper("/l/u")}},
+			wantErr: "cannot have",
+		},
+		{
+			name:    "UpperOnly",
+			mount:   specs.Mount{Type: "overlay", Options: []string{upper("/l/u")}},
+			wantErr: "no " + OverlayLowerOption,
+		},
+		{
+			name:    "TwoUppers",
+			mount:   specs.Mount{Type: "overlay", Options: []string{lower("/l/0"), upper("/l/u"), upper("/l/v")}},
+			wantErr: "more than one",
+		},
+		{
+			name:    "RelativeLayer",
+			mount:   specs.Mount{Type: "overlay", Options: []string{lower("l/0")}},
+			wantErr: "not a clean absolute path",
+		},
+		{
+			name:    "UncleanLayer",
+			mount:   specs.Mount{Type: "overlay", Options: []string{lower("/l/../0")}},
+			wantErr: "not a clean absolute path",
+		},
+		{
+			name:    "RepeatedLayer",
+			mount:   specs.Mount{Type: "overlay", Options: []string{lower("/l/0"), upper("/l/0")}},
+			wantErr: "more than once",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			layers, rest, err := OverlayLayersOf(tc.mount)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("OverlayLayersOf() = %v, want error containing %q", err, tc.wantErr)
+				}
+				if verr := validateMount(&specs.Mount{Destination: "/mnt", Type: tc.mount.Type, Options: tc.mount.Options}); verr == nil {
+					t.Errorf("validateMount() = nil, want an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("OverlayLayersOf() failed: %v", err)
+			}
+			if !reflect.DeepEqual(layers, tc.wantLayers) {
+				t.Errorf("OverlayLayersOf() layers = %+v, want %+v", layers, tc.wantLayers)
+			}
+			if !reflect.DeepEqual(rest, tc.wantRest) {
+				t.Errorf("OverlayLayersOf() rest = %q, want %q", rest, tc.wantRest)
+			}
+		})
+	}
+}

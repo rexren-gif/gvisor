@@ -48,12 +48,22 @@ line unchanged.
 | `--perms` | `<OCTAL>` | Sets the mode of the mount created by the next `--tmpfs` or `--dir`. Must come right before that flag, takes an octal value up to `07777`, and may appear once per action. | Without it, the mount keeps the `tmpfs` default of `01777`, where `bwrap` uses `0755`. `--file`, `--bind-data`, and `--ro-bind-data` are not supported yet. |
 | `--proc` | `<DEST>` | Mounts a new `procfs` filesystem at `DEST`. Repeating the same `DEST` on one command line is a no-op. | `/proc` is mounted in every sandbox whether or not you pass the flag. |
 | `--dev` | `<DEST>` | Mounts gVisor's `dev` filesystem at `DEST` and a new `devpts` at `DEST/pts`. Repeating the same `DEST` on one command line is a no-op. | The device nodes come from the Sentry, not from host bind mounts. `/dev` is mounted in every sandbox whether or not you pass the flag. |
+| `--overlay-src` | `<SRC>` | Adds the host directory `SRC` as the next layer of an overlay. Each `--overlay-src` goes on top of the ones before it. The layers go to the overlay option that follows, which must come directly after them. The layers and `RWSRC` must not be the same directory or contain one another. runsc does not write to `SRC`. | — |
+| `--tmp-overlay` | `<DEST>` | Mounts at `DEST` an overlay of one or more `--overlay-src` layers. Changes stay in the Sentry's memory and go away with the sandbox. The root of the overlay has mode `0755` and belongs to the sandbox user. | — |
+| `--ro-overlay` | `<DEST>` | Mounts at `DEST` a read-only overlay of two or more `--overlay-src` layers. Writes fail with `EROFS`. | — |
+| `--overlay` | `<RWSRC> <WORKDIR> <DEST>` | Mounts at `DEST` an overlay of one or more `--overlay-src` layers. Changes go to the host directory `RWSRC`: a deleted file becomes a `0:0` character device, and a directory that the overlay creates gets the `user.overlay.opaque` extended attribute. `WORKDIR` must not overlap `RWSRC`, and must not be a layer or contain one. | runsc does not use `WORKDIR` and writes nothing to it. runsc also rejects an `RWSRC` inside a layer, so that changes cannot reach the layer. |
 
 <!-- mdformat on -->
 
 > **NOTE:** A mount whose `DEST` is `/` becomes the sandbox root filesystem.
 > Only its source and its read-only bit carry over, so the `rbind, rprivate,
 > nosuid, nodev` options above do not apply to `--bind / /`.
+
+> **NOTE:** The overlay options do not work at `/` or with a bind mount at `/`.
+> runsc prepares the layers in the sandbox root filesystem, which must be the
+> default `tmpfs`. Mounts go in place in the order of the length of their
+> `DEST`, so a mount below an overlay's `DEST` stays visible even if it comes
+> before the overlay on the command line.
 
 > **NOTE:** `SRC` must exist on the host. A missing source aborts the run with
 > `Can't find source path` before the sandbox starts.

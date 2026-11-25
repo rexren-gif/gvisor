@@ -3145,3 +3145,127 @@ func TestCheckpointRestoreCrossEngineChained(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckpointRestoreLayeredOverlay checks that an overlay mount whose
+// layers are other mounts keeps its contents across checkpoint/restore.
+func TestCheckpointRestoreLayeredOverlay(t *testing.T) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+	rootfs := filepath.Join(dir, "rootfs")
+	lower := filepath.Join(dir, "lower")
+	upper := filepath.Join(dir, "upper")
+	imageDir := filepath.Join(dir, "image")
+	for _, d := range []string{rootfs, lower, upper, imageDir} {
+		if err := os.Mkdir(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(lower, "a"), []byte("a"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		upper bool
+	}{
+		{name: "memory"},
+		{name: "host", upper: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, conf := sleepSpecConf(t)
+			spec.Root = &specs.Root{Path: rootfs}
+			// The tmpfs at "/" hides the paths of the layers.
+			spec.Mounts = []specs.Mount{{Destination: "/", Type: "tmpfs"}}
+			for _, d := range []string{"/usr", "/bin", "/sbin", "/lib", "/lib64"} {
+				if _, err := os.Stat(d); err == nil {
+					spec.Mounts = append(spec.Mounts, specs.Mount{Destination: d, Source: d, Type: "bind", Options: []string{"ro"}})
+				}
+			}
+			spec.Mounts = append(spec.Mounts, specs.Mount{Destination: "/.layers/0", Source: lower, Type: "bind", Options: []string{"ro"}})
+			opts := []string{specutils.OverlayLowerOption + "=/.layers/0"}
+			if tc.upper {
+				spec.Mounts = append(spec.Mounts, specs.Mount{Destination: "/.layers/upper", Source: upper, Type: "bind"})
+				opts = append(opts, specutils.OverlayUpperOption+"=/.layers/upper")
+			}
+			spec.Mounts = append(spec.Mounts, specs.Mount{Destination: "/mnt", Source: "overlay", Type: "overlay", Options: opts})
+
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForProcessCount(cont, 1); err != nil {
+				t.Fatal(err)
+			}
+			if ws, err := execute(conf, cont, "/bin/sh", "-c", "echo n > /mnt/"+tc.name); err != nil || ws != 0 {
+				t.Fatalf("writing to the overlay: %v, ws: %v", err, ws)
+			}
+
+			image := filepath.Join(imageDir, tc.name)
+			if err := os.Mkdir(image, 0777); err != nil {
+				t.Fatal(err)
+			}
+			if err := cont.Checkpoint(conf, image, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelDefault}); err != nil {
+				t.Fatalf("error checkpointing container to file: %v", err)
+			}
+			cont.Destroy()
+			cont = nil
+
+			cont2, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont2.Destroy()
+			if err := cont2.Restore(conf, image, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+			if ws, err := execute(conf, cont2, "/usr/bin/test", "-f", "/mnt/a", "-a", "-f", "/mnt/"+tc.name); err != nil || ws != 0 {
+				t.Fatalf("overlay contents after restore: %v, ws: %v", err, ws)
+			}
+			// The overlay still takes changes after restore.
+			after := "after-" + tc.name
+			if ws, err := execute(conf, cont2, "/bin/sh", "-c", "echo m > /mnt/"+after+" && rm /mnt/a && test ! -e /mnt/a"); err != nil || ws != 0 {
+				t.Fatalf("changing the overlay after restore: %v, ws: %v", err, ws)
+			}
+			if tc.upper {
+				for _, name := range []string{tc.name, after} {
+					if info, err := os.Stat(filepath.Join(upper, name)); err != nil || !info.Mode().IsRegular() {
+						t.Errorf("upper/%s: %v, %v; want a regular file", name, info, err)
+					}
+				}
+				var st unix.Stat_t
+				if err := unix.Lstat(filepath.Join(upper, "a"), &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFCHR || st.Rdev != 0 {
+					t.Errorf("upper/a: mode %o, device %d, %v; want a 0:0 character device", st.Mode, st.Rdev, err)
+				}
+			}
+			for _, name := range []string{tc.name, after} {
+				if _, err := os.Stat(filepath.Join(lower, name)); !os.IsNotExist(err) {
+					t.Errorf("the lower layer changed: os.Stat(%q) = %v", name, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(lower, "a")); err != nil {
+				t.Errorf("the lower layer changed: os.Stat(\"a\") = %v", err)
+			}
+		})
+	}
+}

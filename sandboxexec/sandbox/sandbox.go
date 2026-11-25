@@ -114,13 +114,36 @@ const (
 	MountTypeDevpts
 	// MountTypeCgroup represents a cgroupfs mount.
 	MountTypeCgroup
+	// MountTypeOverlay represents an overlay of host directories. The sandbox
+	// prepares its layers in "/.gvisor-overlay" of the root filesystem, a path
+	// that it reserves. So it needs the default root filesystem with an
+	// earlier MountTypeTmpfs mount at "/" that keeps the layers out of the
+	// sandbox's view, and no other mount can be in "/.gvisor-overlay".
+	// It cannot be at "/". Recursive and Private do not apply to it. With
+	// ReadOnly, it has no upper layer and needs 2 or more Lowers.
+	MountTypeOverlay
 )
 
-// Mount holds settings for a custom host bind directory or in-memory mount.
+// Mount holds settings for a custom host bind directory, an in-memory mount
+// or an overlay of host directories.
 type Mount struct {
 	Source      string
 	Destination string
 	Type        MountType
+
+	// Lowers are the host directories that make the read-only layers of a
+	// MountTypeOverlay mount, from the bottom layer to the top layer. The
+	// sandbox does not write to them. The caller must make sure that they and
+	// Upper are not the same directory and do not contain one another.
+	Lowers []string
+
+	// Upper is the host directory that receives the changes made in a
+	// MountTypeOverlay mount. When Upper is empty, the changes stay in the
+	// sandbox's memory, or fail with EROFS when ReadOnly is set. Deleted
+	// files are recorded in Upper as character devices 0:0, and directories
+	// that the overlay creates have the "user.overlay.opaque" extended
+	// attribute.
+	Upper string
 
 	// ReadOnly adds "ro".
 	ReadOnly bool

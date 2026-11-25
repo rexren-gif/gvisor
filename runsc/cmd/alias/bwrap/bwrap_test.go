@@ -77,6 +77,10 @@ func TestSandboxOptions(t *testing.T) {
 		return result
 	}
 
+	// stage is where the sandbox prepares the layers of an overlay that
+	// comes right after the tmpfs root and the default mounts.
+	stage := "/.gvisor-overlay/" + strconv.Itoa(1+len(defaultMounts))
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Failed to get current working directory: %v", err)
@@ -174,6 +178,55 @@ func TestSandboxOptions(t *testing.T) {
 				Args: []string{"ls"},
 			},
 			errContains: "--uid requires --unshare-user",
+		},
+		{
+			// The layers become read-only binds that the overlay mount names,
+			// and a later mount at the same destination stays after it.
+			name: "Overlay",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeOverlay, Destination: "/mnt", Lowers: []string{"/l1", "/l2"}, Upper: "/rw"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"},
+				},
+				Args: []string{"ls"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "rootfs"},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: appendMounts(
+					[]specs.Mount{{Type: "tmpfs", Destination: "/"}},
+					defaultMounts,
+					[]specs.Mount{
+						{Type: "bind", Source: "/l1", Destination: stage + "/0", Options: []string{"ro", "nosuid", "nodev"}},
+						{Type: "bind", Source: "/l2", Destination: stage + "/1", Options: []string{"ro", "nosuid", "nodev"}},
+						{Type: "bind", Source: "/rw", Destination: stage + "/upper", Options: []string{"nosuid", "nodev"}},
+						{Type: "overlay", Source: "overlay", Destination: "/mnt", Options: []string{
+							"dev.gvisor.overlay.lower=" + stage + "/0",
+							"dev.gvisor.overlay.lower=" + stage + "/1",
+							"dev.gvisor.overlay.upper=" + stage + "/upper",
+						}},
+						{Type: "tmpfs", Destination: "/mnt"},
+					},
+				),
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			name: "OverlayWithRootBind",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeBind, Source: "/", Destination: "/", ReadOnly: true},
+					{Type: sandbox.MountTypeOverlay, Destination: "/mnt", Lowers: []string{"/l1"}},
+				},
+				Args: []string{"ls"},
+			},
+			errContains: "overlay options together with a bind mount at /",
 		},
 	}
 
@@ -939,6 +992,298 @@ func TestParseFlags(t *testing.T) {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 
+			if diff := cmp.Diff(cfg, tc.wantCfg, cmpopts.IgnoreUnexported(bwrapConfig{})); diff != "" {
+				t.Errorf("bwrapConfig mismatch (-got +want):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestParseOverlay checks the parsing of --overlay-src and of the options
+// that mount its layers.
+func TestParseOverlay(t *testing.T) {
+	dir := t.TempDir()
+	l1 := filepath.Join(dir, "l1")
+	l2 := filepath.Join(dir, "l2")
+	rw := filepath.Join(dir, "rw")
+	work := filepath.Join(dir, "work")
+	l1Sub := filepath.Join(l1, "sub")
+	rwSub := filepath.Join(rw, "sub")
+	for _, d := range []string{l1, l1Sub, l1 + "x", l2, rw, rwSub, work} {
+		if err := os.Mkdir(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l2Link := filepath.Join(dir, "l2link")
+	if err := os.Symlink(l2, l2Link); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "missing")
+	workLink := filepath.Join(dir, "worklink")
+	if err := os.Symlink(rw, workLink); err != nil {
+		t.Fatal(err)
+	}
+	wantCfg := func(mounts ...sandbox.Mount) *bwrapConfig {
+		return &bwrapConfig{Env: os.Environ(), UID: -1, GID: -1, Mounts: mounts, Args: []string{"bash"}}
+	}
+	overlay := func(dst string, layers ...string) sandbox.Mount {
+		return sandbox.Mount{Type: sandbox.MountTypeOverlay, Destination: dst, Lowers: layers, NoSuid: true}
+	}
+
+	// Relative sources resolve against the working directory.
+	t.Chdir(dir)
+
+	tests := []struct {
+		name        string
+		args        []string
+		wantCfg     *bwrapConfig
+		errContains string
+	}{
+		{
+			name:    "TmpOverlay",
+			args:    []string{"--overlay-src", l1, "--tmp-overlay", "/mnt/", "bash"},
+			wantCfg: wantCfg(overlay("/mnt", l1)),
+		},
+		{
+			name:    "TmpOverlayTwoLayers",
+			args:    []string{"--overlay-src", "l1", "--overlay-src", l2 + "/", "--tmp-overlay", "/mnt", "bash"},
+			wantCfg: wantCfg(overlay("/mnt", l1, l2)),
+		},
+		{
+			name: "RoOverlay",
+			args: []string{"--overlay-src", l1, "--overlay-src", l2, "--ro-overlay", "/mnt", "bash"},
+			wantCfg: wantCfg(sandbox.Mount{
+				Type: sandbox.MountTypeOverlay, Destination: "/mnt", Lowers: []string{l1, l2}, ReadOnly: true, NoSuid: true,
+			}),
+		},
+		{
+			name: "Overlay",
+			args: []string{"--overlay-src", l1, "--overlay", "rw", work, "/mnt", "bash"},
+			wantCfg: wantCfg(sandbox.Mount{
+				Type: sandbox.MountTypeOverlay, Destination: "/mnt", Lowers: []string{l1}, Upper: rw, NoSuid: true,
+			}),
+		},
+		{
+			// Each overlay option takes the layers given since the one before.
+			name: "TwoOverlays",
+			args: []string{
+				"--overlay-src", l1, "--tmp-overlay", "/a",
+				"--overlay-src", l2, "--overlay-src", l1, "--tmp-overlay", "/b",
+				"--tmpfs", "/b", "bash",
+			},
+			wantCfg: wantCfg(
+				overlay("/a", l1),
+				overlay("/b", l2, l1),
+				sandbox.Mount{Type: sandbox.MountTypeTmpfs, Destination: "/b"},
+			),
+		},
+		{
+			// WORKDIR may be in a source; runsc does not use it.
+			name: "WorkdirInSource",
+			args: []string{"--overlay-src", l1, "--overlay", rw, l1Sub, "/mnt", "bash"},
+			wantCfg: wantCfg(sandbox.Mount{
+				Type: sandbox.MountTypeOverlay, Destination: "/mnt", Lowers: []string{l1}, Upper: rw, NoSuid: true,
+			}),
+		},
+		{
+			name:        "RWSRCUnderRootLayer",
+			args:        []string{"--overlay-src", "/", "--overlay", rw, work, "/mnt", "bash"},
+			errContains: "overlap",
+		},
+		{
+			name:        "SameSourceTwice",
+			args:        []string{"--overlay-src", l1, "--overlay-src", l1, "--ro-overlay", "/mnt", "--", "bash"},
+			errContains: "overlap",
+		},
+		{
+			name:        "SourceInSource",
+			args:        []string{"--overlay-src", l1Sub, "--overlay-src", l1, "--ro-overlay", "/mnt", "--", "bash"},
+			errContains: "overlap",
+		},
+		{
+			name:        "SourceLinksToSource",
+			args:        []string{"--overlay-src", l2, "--overlay-src", l2Link, "--ro-overlay", "/mnt", "--", "bash"},
+			errContains: "overlap",
+		},
+		{
+			name:        "RWSRCInSource",
+			args:        []string{"--overlay-src", l1, "--overlay", l1Sub, work, "/mnt", "bash"},
+			errContains: "overlap",
+		},
+		{
+			name:        "RWSRCIsSource",
+			args:        []string{"--overlay-src", l1, "--overlay-src", rw, "--overlay", rw, work, "/mnt", "bash"},
+			errContains: "overlap",
+		},
+		{
+			// A shared path prefix that is not a parent is no overlap.
+			name:    "SourcesWithCommonPrefix",
+			args:    []string{"--overlay-src", l1, "--overlay-src", l1 + "x", "--ro-overlay", "/mnt", "--", "bash"},
+			wantCfg: wantCfg(sandbox.Mount{Type: sandbox.MountTypeOverlay, Destination: "/mnt", Lowers: []string{l1, l1 + "x"}, ReadOnly: true, NoSuid: true}),
+		},
+		{
+			name:        "RoOverlayOneLayer",
+			args:        []string{"--overlay-src", l1, "--ro-overlay", "/mnt", "bash"},
+			errContains: "--ro-overlay needs 2 or more --overlay-src",
+		},
+		{
+			name:        "TmpOverlayNoLayers",
+			args:        []string{"--tmp-overlay", "/mnt", "bash"},
+			errContains: "--tmp-overlay needs 1 or more --overlay-src",
+		},
+		{
+			name:        "OverlayNoLayers",
+			args:        []string{"--overlay", rw, work, "/mnt", "bash"},
+			errContains: "--overlay needs 1 or more --overlay-src",
+		},
+		{
+			// The layers of one overlay option do not carry over to the next.
+			name:        "LayersUsedUp",
+			args:        []string{"--overlay-src", l1, "--overlay-src", l2, "--ro-overlay", "/a", "--ro-overlay", "/b", "bash"},
+			errContains: "--ro-overlay needs 2 or more --overlay-src",
+		},
+		{
+			name:        "SourceBeforeOtherOption",
+			args:        []string{"--overlay-src", l1, "--tmpfs", "/x", "--tmp-overlay", "/mnt", "bash"},
+			errContains: "no overlay option takes the --overlay-src layers",
+		},
+		{
+			name:        "SourceBeforePerms",
+			args:        []string{"--overlay-src", l1, "--perms", "0700", "--tmp-overlay", "/mnt", "bash"},
+			errContains: "no overlay option takes the --overlay-src layers",
+		},
+		{
+			name:        "SourceBeforeCommand",
+			args:        []string{"--overlay-src", l1, "bash"},
+			errContains: "no overlay option takes the --overlay-src layers",
+		},
+		{
+			name:        "SourceBeforeDelimiter",
+			args:        []string{"--overlay-src", l1, "--", "bash"},
+			errContains: "no overlay option takes the --overlay-src layers",
+		},
+		{
+			name:        "SourceAtEnd",
+			args:        []string{"--overlay-src", l1},
+			errContains: "no overlay option takes the --overlay-src layers",
+		},
+		{
+			name:        "MissingSource",
+			args:        []string{"--overlay-src", missing, "--tmp-overlay", "/mnt", "bash"},
+			errContains: "Can't find source path " + missing,
+		},
+		{
+			name:        "EmptySource",
+			args:        []string{"--overlay-src", "", "--tmp-overlay", "/mnt", "bash"},
+			errContains: "the path is empty",
+		},
+		{
+			name:        "EmptyRWSRC",
+			args:        []string{"--overlay-src", l1, "--overlay", "", work, "/mnt", "bash"},
+			errContains: "the path is empty",
+		},
+		{
+			name:        "EmptyWorkdir",
+			args:        []string{"--overlay-src", l1, "--overlay", rw, "", "/mnt", "bash"},
+			errContains: "the path is empty",
+		},
+		{
+			name:        "FileSource",
+			args:        []string{"--overlay-src", file, "--tmp-overlay", "/mnt", "bash"},
+			errContains: file + ": not a directory",
+		},
+		{
+			name:        "MissingRWSRC",
+			args:        []string{"--overlay-src", l1, "--overlay", missing, work, "/mnt", "bash"},
+			errContains: "Can't find source path " + missing,
+		},
+		{
+			name:        "MissingWorkdir",
+			args:        []string{"--overlay-src", l1, "--overlay", rw, missing, "/mnt", "bash"},
+			errContains: "Can't find source path " + missing,
+		},
+		{
+			name:        "WorkdirIsRWSRC",
+			args:        []string{"--overlay-src", l1, "--overlay", rw, rw, "/mnt", "bash"},
+			errContains: "WORKDIR " + rw + " and RWSRC " + rw + " overlap",
+		},
+		{
+			name:        "WorkdirLinksToRWSRC",
+			args:        []string{"--overlay-src", l1, "--overlay", rw, workLink, "/mnt", "bash"},
+			errContains: "and RWSRC " + rw + " overlap",
+		},
+		{
+			name:        "WorkdirInRWSRC",
+			args:        []string{"--overlay-src", l1, "--overlay", rw, rwSub, "/mnt", "bash"},
+			errContains: "WORKDIR " + rwSub + " and RWSRC " + rw + " overlap",
+		},
+		{
+			name:        "WorkdirIsSource",
+			args:        []string{"--overlay-src", l1, "--overlay", rw, l1, "/mnt", "bash"},
+			errContains: "WORKDIR " + l1 + " is or contains the layer " + l1,
+		},
+		{
+			name:        "WorkdirAboveSource",
+			args:        []string{"--overlay-src", l1Sub, "--overlay", rw, l1, "/mnt", "bash"},
+			errContains: "is or contains the layer",
+		},
+		{
+			name:        "AtRoot",
+			args:        []string{"--overlay-src", l1, "--tmp-overlay", "/", "bash"},
+			errContains: "--tmp-overlay at / is not supported",
+		},
+		{
+			name:        "EmptyDest",
+			args:        []string{"--overlay-src", l1, "--tmp-overlay", "", "bash"},
+			errContains: "destination path is empty",
+		},
+		{
+			name:        "MissingOverlaySrcArg",
+			args:        []string{"--overlay-src"},
+			errContains: "--overlay-src takes 1 argument",
+		},
+		{
+			name:        "MissingOverlayArgs",
+			args:        []string{"--overlay-src", l1, "--overlay", rw, work},
+			errContains: "--overlay takes 3 arguments",
+		},
+		{
+			name:        "MissingTmpOverlayArg",
+			args:        []string{"--overlay-src", l1, "--tmp-overlay"},
+			errContains: "--tmp-overlay takes 1 argument",
+		},
+		{
+			name:        "MissingRoOverlayArg",
+			args:        []string{"--overlay-src", l1, "--overlay-src", l2, "--ro-overlay"},
+			errContains: "--ro-overlay takes 1 argument",
+		},
+		{
+			name:        "PermsBeforeOverlay",
+			args:        []string{"--overlay-src", l1, "--perms", "0700"},
+			errContains: "no overlay option takes the --overlay-src layers",
+		},
+		{
+			name:        "PermsBeforeOverlaySrc",
+			args:        []string{"--perms", "0700", "--overlay-src", l1, "--tmp-overlay", "/mnt", "bash"},
+			errContains: "--perms must be followed by",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseBwrapArgs(tc.args)
+			if tc.errContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.errContains) {
+					t.Fatalf("parseBwrapArgs() = %v, want error containing %q", err, tc.errContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseBwrapArgs() failed: %v", err)
+			}
 			if diff := cmp.Diff(cfg, tc.wantCfg, cmpopts.IgnoreUnexported(bwrapConfig{})); diff != "" {
 				t.Errorf("bwrapConfig mismatch (-got +want):\n%s", diff)
 			}

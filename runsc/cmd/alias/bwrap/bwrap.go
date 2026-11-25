@@ -25,6 +25,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -94,6 +95,9 @@ type bwrapConfig struct {
 	AsPID1      bool
 	hasArgv0    bool
 	nextPerms   *uint32
+	// overlaySrcs are the --overlay-src layers that the next overlay option
+	// takes, from bottom to top.
+	overlaySrcs []string
 }
 
 // String returns a string representation of the bwrapConfig.
@@ -330,6 +334,11 @@ func (c *bwrapConfig) prepareSandbox() ([]sandbox.Option, error) {
 
 	var mounts []sandbox.Mount
 	if rootMount, ok := c.getRootMount(); ok {
+		// The sandbox prepares the overlay layers in the root filesystem
+		// that the gofer serves, which must not be a host directory.
+		if slices.ContainsFunc(c.Mounts, func(m sandbox.Mount) bool { return m.Type == sandbox.MountTypeOverlay }) {
+			return nil, fmt.Errorf("bwrap: runsc does not support overlay options together with a bind mount at /")
+		}
 		opts = append(opts, sandbox.WithRootfs(rootMount.Source, rootMount.ReadOnly))
 	} else {
 		mounts = append(mounts, sandbox.Mount{Destination: "/", Type: sandbox.MountTypeTmpfs})

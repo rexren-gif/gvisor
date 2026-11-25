@@ -15,6 +15,7 @@ go_library(
         "//:__subpackages__",
     ],
     deps = [
+        "//pkg/bpf",
         "//pkg/log",
         "//runsc/cmd/util",
         "//runsc/config",
@@ -32,6 +33,8 @@ go_test(
     srcs = ["bwrap_test.go"],
     embed = [":bwrap"],
     deps = [
+        "//pkg/abi/linux",
+        "//pkg/bpf",
         "//runsc/config",
         "//sandboxexec/sandbox",
         "@com_github_google_go_cmp//cmp:go_default_library",
@@ -43,7 +46,11 @@ go_test(
 
 go_test(
     name = "bwrap_integration_test",
-    srcs = ["bwrap_integration_test.go"],
+    srcs = [
+        "bwrap_integration_test.go",
+        "bwrap_ptrace_amd64_test.go",
+        "bwrap_ptrace_arm64_test.go",
+    ],
     data = [
         "//:release",
     ],
@@ -53,6 +60,8 @@ go_test(
         "manual",
     ],
     deps = [
+        "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/test/testutil",
         "//runsc/specutils",
         "@com_github_google_go_cmp//cmp:go_default_library",

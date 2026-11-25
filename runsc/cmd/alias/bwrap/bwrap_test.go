@@ -26,6 +26,8 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/sandboxexec/sandbox"
 )
@@ -920,6 +922,85 @@ func TestParseFlags(t *testing.T) {
 			args:        []string{"--perms", "0700", "--ro-bind", "/", "/", "--", "bash"},
 			errContains: "--perms must be followed by",
 		},
+		{
+			name: "Seccomp",
+			args: []string{"--seccomp", "3", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:       os.Environ(),
+				UID:       -1,
+				GID:       -1,
+				SeccompFD: intPtr(3),
+				Args:      []string{"bash"},
+			},
+		},
+		{
+			name: "SeccompRepeated",
+			args: []string{"--seccomp", "3", "--seccomp", "4", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:       os.Environ(),
+				UID:       -1,
+				GID:       -1,
+				SeccompFD: intPtr(4),
+				Args:      []string{"bash"},
+			},
+		},
+		{
+			name: "AddSeccompFD",
+			args: []string{"--add-seccomp-fd", "3", "--add-seccomp-fd", "4", "--add-seccomp-fd", "3", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:           os.Environ(),
+				UID:           -1,
+				GID:           -1,
+				AddSeccompFDs: []int{3, 4, 3},
+				Args:          []string{"bash"},
+			},
+		},
+		{
+			name:        "SeccompThenAddSeccompFD",
+			args:        []string{"--seccomp", "3", "--add-seccomp-fd", "4", "bash"},
+			errContains: "--seccomp and --add-seccomp-fd are mutually exclusive",
+		},
+		{
+			name:        "AddSeccompFDThenSeccomp",
+			args:        []string{"--add-seccomp-fd", "3", "--seccomp", "4", "bash"},
+			errContains: "--seccomp and --add-seccomp-fd are mutually exclusive",
+		},
+		{
+			name:        "SeccompMissingFD",
+			args:        []string{"--seccomp"},
+			errContains: "--seccomp takes 1 argument",
+		},
+		{
+			name:        "AddSeccompFDMissingFD",
+			args:        []string{"--add-seccomp-fd"},
+			errContains: "--add-seccomp-fd takes 1 argument",
+		},
+		{
+			name:        "SeccompNotANumber",
+			args:        []string{"--seccomp", "abc", "bash"},
+			errContains: "Invalid fd: abc",
+		},
+		{
+			name:        "SeccompNegativeFD",
+			args:        []string{"--seccomp", "-1", "bash"},
+			errContains: "Invalid fd: -1",
+		},
+		{
+			name:        "AddSeccompFDTooLarge",
+			args:        []string{"--add-seccomp-fd", "4294967296", "bash"},
+			errContains: "Invalid fd: 4294967296",
+		},
+		{
+			// Without a 32-bit limit, this would be descriptor 2 for the kernel.
+			name:        "SeccompTooLarge",
+			args:        []string{"--seccomp", "4294967298", "bash"},
+			errContains: "Invalid fd: 4294967298",
+		},
+		{
+			name:        "PermsBeforeSeccomp",
+			args:        []string{"--perms", "0700", "--seccomp", "3", "bash"},
+			errContains: "--perms must be followed by",
+		},
 	}
 
 	for _, tc := range tests {
@@ -1168,4 +1249,264 @@ func mkdirMode(t *testing.T, path string, mode os.FileMode) {
 	if err := os.Chmod(path, mode); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func intPtr(v int) *int { return &v }
+
+// allowFilter returns a seccomp filter of n instructions that allows every
+// system call.
+func allowFilter(n int) []byte {
+	insns := make([]bpf.Instruction, n)
+	for i := range insns {
+		insns[i] = bpf.Stmt(bpf.Ret|bpf.K, uint32(linux.SECCOMP_RET_ALLOW))
+	}
+	return bpf.ToBytecode(insns)
+}
+
+// inheritedFD returns a descriptor that reads data and is not close-on-exec,
+// like a descriptor that runsc inherits.
+func inheritedFD(t *testing.T, data []byte) int {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer r.Close()
+	if _, err := w.Write(data); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// dup(2) clears close-on-exec.
+	fd, err := unix.Dup(int(r.Fd()))
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	return fd
+}
+
+// isOpen reports whether fd is an open descriptor.
+func isOpen(fd int) bool {
+	_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	return err == nil
+}
+
+// TestReadSeccompFilter checks which descriptors readSeccompFilter reads.
+func TestReadSeccompFilter(t *testing.T) {
+	t.Run("ClosedFD", func(t *testing.T) {
+		fd := inheritedFD(t, allowFilter(1))
+		unix.Close(fd)
+		if _, err := readSeccompFilter(fd); !errors.Is(err, unix.EBADF) {
+			t.Errorf("readSeccompFilter() = %v, want %v", err, unix.EBADF)
+		}
+	})
+
+	t.Run("Endless", func(t *testing.T) {
+		zero, err := unix.Open("/dev/zero", unix.O_RDONLY, 0)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		got, err := readSeccompFilter(zero)
+		if err != nil {
+			t.Fatalf("readSeccompFilter() failed: %v", err)
+		}
+		if len(got) != maxSeccompFilterSize+1 {
+			t.Errorf("readSeccompFilter() read %d bytes, want %d", len(got), maxSeccompFilterSize+1)
+		}
+		if isOpen(zero) {
+			unix.Close(zero)
+			t.Errorf("fd %d is still open", zero)
+		}
+	})
+
+	t.Run("CloseOnExecFD", func(t *testing.T) {
+		// runsc opens its own descriptors close-on-exec.
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		defer r.Close()
+		defer w.Close()
+		if _, err := readSeccompFilter(int(r.Fd())); !errors.Is(err, unix.EBADF) {
+			t.Errorf("readSeccompFilter() = %v, want %v", err, unix.EBADF)
+		}
+		if !isOpen(int(r.Fd())) {
+			t.Errorf("readSeccompFilter() closed a descriptor of runsc")
+		}
+	})
+}
+
+// TestReadSeccompFilters checks which descriptors readSeccompFilters reads
+// for --seccomp and --add-seccomp-fd.
+func TestReadSeccompFilters(t *testing.T) {
+	// noReturn loads the system call number and does not return.
+	noReturn := bpf.ToBytecode([]bpf.Instruction{bpf.Stmt(bpf.Ld|bpf.W|bpf.Abs, 0)})
+	badOpcode := bpf.ToBytecode([]bpf.Instruction{bpf.RawInstruction(0xffff, 0, 0, 0)})
+	for _, tc := range []struct {
+		name        string
+		data        []byte
+		errContains string
+	}{
+		{name: "OneInstruction", data: allowFilter(1)},
+		{name: "MaxInstructions", data: allowFilter(bpf.MaxInstructions)},
+		{name: "Empty", data: nil, errContains: "filter is empty"},
+		{name: "NotMultipleOfInstructionSize", data: []byte{1, 2, 3}, errContains: "not a multiple of 8 bytes"},
+		{name: "TooManyInstructions", data: allowFilter(bpf.MaxInstructions + 1), errContains: "more than 4096 instructions"},
+		{name: "NoReturn", data: noReturn, errContains: "not a valid BPF program"},
+		{name: "BadOpcode", data: badOpcode, errContains: "not a valid BPF program"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fd := inheritedFD(t, tc.data)
+			cfg, err := parseBwrapArgs([]string{"--seccomp", strconv.Itoa(fd), "bash"})
+			if err != nil {
+				t.Fatalf("parseBwrapArgs() failed: %v", err)
+			}
+			err = cfg.readSeccompFilters()
+			if isOpen(fd) {
+				unix.Close(fd)
+				t.Errorf("fd %d is still open", fd)
+			}
+			if tc.errContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.errContains) {
+					t.Fatalf("readSeccompFilters() = %v, want error containing %q", err, tc.errContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readSeccompFilters() failed: %v", err)
+			}
+			if diff := cmp.Diff([][]byte{tc.data}, cfg.seccompFilters); diff != "" {
+				t.Errorf("filters mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+
+	t.Run("SeccompSameFDRepeated", func(t *testing.T) {
+		fd := inheritedFD(t, allowFilter(2))
+		other := inheritedFD(t, allowFilter(1))
+		cfg, err := parseBwrapArgs([]string{
+			"--seccomp", strconv.Itoa(fd),
+			"--seccomp", strconv.Itoa(other),
+			"--seccomp", strconv.Itoa(fd),
+			"bash",
+		})
+		if err != nil {
+			t.Fatalf("parseBwrapArgs() failed: %v", err)
+		}
+		if diff := cmp.Diff([]int{fd, other}, cfg.unusedSeccompFDs); diff != "" {
+			t.Errorf("unused fds mismatch (-want +got):\n%s", diff)
+		}
+		if err := cfg.readSeccompFilters(); err != nil {
+			t.Fatalf("readSeccompFilters() failed: %v", err)
+		}
+		if diff := cmp.Diff([][]byte{allowFilter(2)}, cfg.seccompFilters); diff != "" {
+			t.Errorf("filters mismatch (-want +got):\n%s", diff)
+		}
+		for _, fd := range []int{fd, other} {
+			if isOpen(fd) {
+				unix.Close(fd)
+				t.Errorf("fd %d is still open", fd)
+			}
+		}
+	})
+
+	t.Run("CombinedLengthTooLarge", func(t *testing.T) {
+		// 8 filters of 4096 instructions, plus 4 for each filter beyond the
+		// first, do not fit in 32768 instructions.
+		args := []string{}
+		for range 8 {
+			args = append(args, "--add-seccomp-fd", strconv.Itoa(inheritedFD(t, allowFilter(bpf.MaxInstructions))))
+		}
+		cfg, err := parseBwrapArgs(append(args, "bash"))
+		if err != nil {
+			t.Fatalf("parseBwrapArgs() failed: %v", err)
+		}
+		if err := cfg.readSeccompFilters(); err == nil || !strings.Contains(err.Error(), "in total") {
+			t.Errorf("readSeccompFilters() = %v, want error containing %q", err, "in total")
+		}
+	})
+
+	t.Run("SeccompLastWins", func(t *testing.T) {
+		first := inheritedFD(t, []byte{1, 2, 3})
+		last := inheritedFD(t, allowFilter(2))
+		cfg, err := parseBwrapArgs([]string{"--seccomp", strconv.Itoa(first), "--seccomp", strconv.Itoa(last), "bash"})
+		if err != nil {
+			t.Fatalf("parseBwrapArgs() failed: %v", err)
+		}
+		if err := cfg.readSeccompFilters(); err != nil {
+			t.Fatalf("readSeccompFilters() failed: %v", err)
+		}
+		if diff := cmp.Diff([][]byte{allowFilter(2)}, cfg.seccompFilters); diff != "" {
+			t.Errorf("filters mismatch (-want +got):\n%s", diff)
+		}
+		for _, fd := range []int{first, last} {
+			if isOpen(fd) {
+				unix.Close(fd)
+				t.Errorf("fd %d is still open", fd)
+			}
+		}
+	})
+
+	t.Run("SeccompReplacedCloseOnExecFD", func(t *testing.T) {
+		// runsc opens its own descriptors close-on-exec, and does not close
+		// them for a replaced --seccomp.
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		defer r.Close()
+		defer w.Close()
+		last := inheritedFD(t, allowFilter(1))
+		cfg, err := parseBwrapArgs([]string{"--seccomp", strconv.Itoa(int(r.Fd())), "--seccomp", strconv.Itoa(last), "bash"})
+		if err != nil {
+			t.Fatalf("parseBwrapArgs() failed: %v", err)
+		}
+		if err := cfg.readSeccompFilters(); err != nil {
+			t.Fatalf("readSeccompFilters() failed: %v", err)
+		}
+		if !isOpen(int(r.Fd())) {
+			t.Errorf("readSeccompFilters() closed a descriptor of runsc")
+		}
+	})
+
+	t.Run("AddSeccompFDInOrder", func(t *testing.T) {
+		first := inheritedFD(t, allowFilter(1))
+		second := inheritedFD(t, allowFilter(3))
+		cfg, err := parseBwrapArgs([]string{"--add-seccomp-fd", strconv.Itoa(first), "--add-seccomp-fd", strconv.Itoa(second), "bash"})
+		if err != nil {
+			t.Fatalf("parseBwrapArgs() failed: %v", err)
+		}
+		if err := cfg.readSeccompFilters(); err != nil {
+			t.Fatalf("readSeccompFilters() failed: %v", err)
+		}
+		if diff := cmp.Diff([][]byte{allowFilter(1), allowFilter(3)}, cfg.seccompFilters); diff != "" {
+			t.Errorf("filters mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("AddSeccompFDSameFDTwice", func(t *testing.T) {
+		fd := inheritedFD(t, allowFilter(1))
+		cfg, err := parseBwrapArgs([]string{"--add-seccomp-fd", strconv.Itoa(fd), "--add-seccomp-fd", strconv.Itoa(fd), "bash"})
+		if err != nil {
+			t.Fatalf("parseBwrapArgs() failed: %v", err)
+		}
+		// The first read closes fd.
+		if err := cfg.readSeccompFilters(); !errors.Is(err, unix.EBADF) {
+			t.Errorf("readSeccompFilters() = %v, want %v", err, unix.EBADF)
+		}
+	})
+
+	t.Run("NoFilters", func(t *testing.T) {
+		cfg, err := parseBwrapArgs([]string{"bash"})
+		if err != nil {
+			t.Fatalf("parseBwrapArgs() failed: %v", err)
+		}
+		if err := cfg.readSeccompFilters(); err != nil {
+			t.Fatalf("readSeccompFilters() failed: %v", err)
+		}
+		if cfg.seccompFilters != nil {
+			t.Errorf("readSeccompFilters() read %v, want no filters", cfg.seccompFilters)
+		}
+	})
 }

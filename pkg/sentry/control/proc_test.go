@@ -15,8 +15,11 @@
 package control
 
 import (
+	"strings"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -68,5 +71,74 @@ func TestPercentCPU(t *testing.T) {
 		if pcpu := percentCPU(tc.stats, tc.startTime, tc.now); pcpu != tc.expected {
 			t.Errorf("percentCPU(%v, %v, %v): got %d, want %d", tc.stats, tc.startTime, tc.now, pcpu, tc.expected)
 		}
+	}
+}
+
+// allowFilter returns a seccomp filter of n instructions that allows every
+// system call.
+func allowFilter(n int) []byte {
+	insns := make([]bpf.Instruction, n)
+	for i := range insns {
+		insns[i] = bpf.Stmt(bpf.Ret|bpf.K, uint32(linux.SECCOMP_RET_ALLOW))
+	}
+	return bpf.ToBytecode(insns)
+}
+
+func TestCompileSeccompFilters(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		programs    [][]byte
+		errContains string
+	}{
+		{name: "None"},
+		{name: "One", programs: [][]byte{allowFilter(1)}},
+		{name: "MaxInstructions", programs: [][]byte{allowFilter(bpf.MaxInstructions), allowFilter(1)}},
+		{
+			// 7 programs of 4096 instructions, plus 4 for each program
+			// beyond the first, fit in 32768 instructions.
+			name:     "MaxCombinedLength",
+			programs: [][]byte{allowFilter(4096), allowFilter(4096), allowFilter(4096), allowFilter(4096), allowFilter(4096), allowFilter(4096), allowFilter(4096)},
+		},
+		{
+			// The optimizer folds each program to 1 instruction, but the
+			// limit applies to the programs as given.
+			name:        "CombinedLengthTooLarge",
+			programs:    [][]byte{allowFilter(4096), allowFilter(4096), allowFilter(4096), allowFilter(4096), allowFilter(4096), allowFilter(4096), allowFilter(4096), allowFilter(4096)},
+			errContains: "out of memory",
+		},
+		{name: "Empty", programs: [][]byte{allowFilter(1), {}}, errContains: "seccomp filter 1: size is 0 bytes"},
+		{name: "NotMultipleOfInstructionSize", programs: [][]byte{{1, 2, 3}}, errContains: "seccomp filter 0: size is 3 bytes"},
+		{name: "TooManyInstructions", programs: [][]byte{allowFilter(bpf.MaxInstructions + 1)}, errContains: "size is 32776 bytes"},
+		{
+			name:        "NoReturn",
+			programs:    [][]byte{bpf.ToBytecode([]bpf.Instruction{bpf.Stmt(bpf.Ld|bpf.W|bpf.Abs, 0)})},
+			errContains: "invalid BPF program",
+		},
+		{
+			name:        "BadOpcode",
+			programs:    [][]byte{bpf.ToBytecode([]bpf.Instruction{bpf.RawInstruction(0xffff, 0, 0, 0)})},
+			errContains: "invalid BPF program",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			filters, err := compileSeccompFilters(tc.programs)
+			if tc.errContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.errContains) {
+					t.Fatalf("compileSeccompFilters() = %v, want error containing %q", err, tc.errContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("compileSeccompFilters() failed: %v", err)
+			}
+			if len(filters) != len(tc.programs) {
+				t.Fatalf("compileSeccompFilters() returned %d filters, want %d", len(filters), len(tc.programs))
+			}
+			for i, f := range filters {
+				if got, want := f.ProgramLength(), len(tc.programs[i])/8; got < 1 || got > want {
+					t.Errorf("filter %d has %d instructions, want 1 to %d", i, got, want)
+				}
+			}
+		})
 	}
 }

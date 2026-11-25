@@ -171,6 +171,37 @@ NET_ADMIN` leaves the sandbox with exactly one capability.
 > default, so `--cap-add NET_RAW` has no effect unless you also pass `runsc
 > --net-raw`.
 
+### System Call Filtering
+
+<!-- mdformat off(no multiline table support in Kramdown) -->
+
+| Flag | Arguments | Description & OCI Mapping | Difference from `bwrap` |
+| :--- | :--- | :--- | :--- |
+| `--seccomp` | `<FD>` | Reads a classic BPF program from `FD` to end of file and closes `FD`. The Sentry installs the program as a seccomp filter on the command before the command starts, and gives the command the `no_new_privs` attribute. Children of the command inherit the filter. If the flag appears more than once, only the last one applies and `runsc` prints a warning. Cannot be combined with `--add-seccomp-fd`. | `/proc/PID/status` has no `Seccomp_filters` line. If `FD` is 0, 1 or 2, the command gets `/dev/null` there. |
+| `--add-seccomp-fd` | `<FD>` | Same as `--seccomp`, but may appear more than once: the Sentry installs every filter, in command-line order, and all of them apply. | Same as `--seccomp`. |
+
+<!-- mdformat on -->
+
+No OCI field holds these filters: `runsc` gives them to the command with `runsc
+exec --seccomp-fd`. The program is an array of `struct sock_filter` in host byte
+order, which is the format that libseccomp's `seccomp_export_bpf` writes. Each
+program must have 1 to 4096 instructions and pass gVisor's BPF checker. The
+total of the program lengths, plus 4 for each program after the first, must not
+be more than 32768 instructions. Otherwise `runsc` fails before the sandbox
+starts. The filter
+receives the architecture of the sandbox (`AUDIT_ARCH_X86_64` or
+`AUDIT_ARCH_AARCH64`) in `seccomp_data.arch`, so the program must check it.
+
+> **NOTE:** The Sentry enforces these filters on the system calls of the
+> command. They do not apply to the host processes that run the sandbox, which
+> have their own host seccomp filter.
+
+> **NOTE:** The placeholder init process of the sandbox has no filter. When you
+> give a filter, no process can trace the init process. Thus the command cannot
+> use it to run system calls that the filter denies. `ptrace` attach, access to
+> its `/proc/[pid]/mem`, `process_vm_readv`, `process_vm_writev` and
+> `pidfd_getfd` on the init process fail.
+
 ### Environment Variables
 
 The sandbox inherits the host environment, and the personality adds nothing of

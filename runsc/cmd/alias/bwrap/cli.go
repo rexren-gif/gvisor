@@ -62,6 +62,8 @@ const (
 	flagDir           = "dir"
 	flagAsPID1        = "as-pid-1"
 	flagDev           = "dev"
+	flagSeccomp       = "seccomp"
+	flagAddSeccompFD  = "add-seccomp-fd"
 )
 
 // Cli implements subcommands.Command for the "bwrap" command.
@@ -94,6 +96,8 @@ type Cli struct {
 	dir           string
 	asPID1        bool
 	dev           string
+	seccomp       string
+	addSeccompFD  string
 }
 
 // Name implements subcommands.Command.Name.
@@ -140,6 +144,8 @@ func (c *Cli) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.dir, flagDir, "", "Create dir at DEST")
 	f.BoolVar(&c.asPID1, flagAsPID1, false, "Do not install a reaper process with PID=1")
 	f.StringVar(&c.dev, flagDev, "", "Mount new dev on DEST")
+	f.StringVar(&c.seccomp, flagSeccomp, "", "Read a classic BPF seccomp filter from FD and apply it to COMMAND; a later --seccomp replaces it")
+	f.StringVar(&c.addSeccompFD, flagAddSeccompFD, "", "Read a classic BPF seccomp filter from FD and apply it to COMMAND, in addition to the filters of earlier --add-seccomp-fd")
 
 	// Override the default usage function to print the custom usage message.
 	f.Usage = func() {
@@ -237,6 +243,10 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 			i, err = cfg.parseAsPID1(bwrapArgs, i)
 		case flagDev:
 			i, err = cfg.parseDev(bwrapArgs, i)
+		case flagSeccomp:
+			i, err = cfg.parseSeccomp(bwrapArgs, i)
+		case flagAddSeccompFD:
+			i, err = cfg.parseAddSeccompFD(bwrapArgs, i)
 		default:
 			return nil, fmt.Errorf("bwrap: Unknown option: %s", arg)
 		}
@@ -480,6 +490,50 @@ func (c *bwrapConfig) parseDev(args []string, i int) (int, error) {
 	}
 	c.Mounts = append(c.Mounts, dev, pts)
 
+	return i + 2, nil
+}
+
+// parseSeccompFD parses the FD argument of --seccomp or --add-seccomp-fd.
+func parseSeccompFD(args []string, i int, name string) (int, error) {
+	if i+1 >= len(args) {
+		return 0, fmt.Errorf("bwrap: --%s takes 1 argument", name)
+	}
+	fd, err := strconv.ParseInt(args[i+1], 10, 32)
+	if err != nil || fd < 0 {
+		return 0, fmt.Errorf("bwrap: Invalid fd: %s", args[i+1])
+	}
+	return int(fd), nil
+}
+
+// parseSeccomp handles --seccomp FD. Only the last --seccomp applies. The
+// descriptors of the others are closed without being read.
+func (c *bwrapConfig) parseSeccomp(args []string, i int) (int, error) {
+	fd, err := parseSeccompFD(args, i, flagSeccomp)
+	if err != nil {
+		return i, err
+	}
+	if len(c.AddSeccompFDs) > 0 {
+		return i, fmt.Errorf("bwrap: --%s and --%s are mutually exclusive", flagSeccomp, flagAddSeccompFD)
+	}
+	if c.SeccompFD != nil {
+		fmt.Fprintf(os.Stderr, "bwrap: --%s given more than once, only the last one applies\n", flagSeccomp)
+		c.unusedSeccompFDs = append(c.unusedSeccompFDs, *c.SeccompFD)
+	}
+	c.SeccompFD = &fd
+	return i + 2, nil
+}
+
+// parseAddSeccompFD handles --add-seccomp-fd FD. All of them are used, in
+// command-line order.
+func (c *bwrapConfig) parseAddSeccompFD(args []string, i int) (int, error) {
+	fd, err := parseSeccompFD(args, i, flagAddSeccompFD)
+	if err != nil {
+		return i, err
+	}
+	if c.SeccompFD != nil {
+		return i, fmt.Errorf("bwrap: --%s and --%s are mutually exclusive", flagSeccomp, flagAddSeccompFD)
+	}
+	c.AddSeccompFDs = append(c.AddSeccompFDs, fd)
 	return i + 2, nil
 }
 

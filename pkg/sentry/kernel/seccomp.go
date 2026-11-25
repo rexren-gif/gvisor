@@ -429,34 +429,64 @@ func (ts *taskSeccomp) populateCache(t *Task) {
 	ts.cacheAuditNumber = auditNumber
 }
 
+// CheckSyscallFiltersLength returns ENOMEM if a task without filters cannot
+// hold filters with the given program lengths, in instructions, because of
+// the limit on their combined length that AppendSyscallFilter applies.
+func CheckSyscallFiltersLength(lengths ...int) error {
+	totalLength := 0
+	for i, length := range lengths {
+		totalLength += length
+		if i > 0 {
+			totalLength += 4
+		}
+	}
+	if totalLength > maxSyscallFilterInstructions {
+		return linuxerr.ENOMEM
+	}
+	return nil
+}
+
 // AppendSyscallFilter adds f as a system call filter.
 //
-// Preconditions: The caller must be running on the task goroutine.
+// Preconditions: The caller must be running on the task goroutine, or the
+// task must not have started.
 func (t *Task) AppendSyscallFilter(f SyscallFilter, syncAll bool) error {
+	return t.AppendSyscallFilters([]SyscallFilter{f}, syncAll)
+}
+
+// AppendSyscallFilters adds filters as system call filters, in order. It
+// builds the cache of system call actions one time for all of them.
+//
+// Preconditions: The caller must be running on the task goroutine, or the
+// task must not have started.
+func (t *Task) AppendSyscallFilters(filters []SyscallFilter, syncAll bool) error {
+	if len(filters) == 0 {
+		return nil
+	}
+
 	// While syscallFilters are an atomic.Value we must take the mutex to prevent
 	// our read-copy-update from happening while another task is syncing syscall
 	// filters to us, this keeps the filters in a consistent state.
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
 
+	newSeccomp := &taskSeccomp{}
+	if ts := t.seccomp.Load(); ts != nil {
+		newSeccomp.filters = append(newSeccomp.filters, ts.filters...)
+	}
+	newSeccomp.filters = append(newSeccomp.filters, filters...)
+
 	// Cap the combined length of all syscall filters (plus a penalty of 4
 	// instructions per filter beyond the first) to maxSyscallFilterInstructions.
 	// This restriction is inherited from Linux.
-	totalLength := f.ProgramLength()
-	newSeccomp := &taskSeccomp{}
-
-	if ts := t.seccomp.Load(); ts != nil {
-		for _, existing := range ts.filters {
-			totalLength += existing.ProgramLength() + 4
-		}
-		newSeccomp.filters = append(newSeccomp.filters, ts.filters...)
+	totalLength := 4 * (len(newSeccomp.filters) - 1)
+	for _, f := range newSeccomp.filters {
+		totalLength += f.ProgramLength()
 	}
-
 	if totalLength > maxSyscallFilterInstructions {
 		return linuxerr.ENOMEM
 	}
 
-	newSeccomp.filters = append(newSeccomp.filters, f)
 	newSeccomp.populateCache(t)
 	t.seccomp.Store(newSeccomp)
 

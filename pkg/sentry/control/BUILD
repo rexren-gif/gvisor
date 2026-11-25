@@ -44,6 +44,7 @@ go_library(
         ":control_api_go_proto",
         ":tpu_control_proto_go_proto",
         "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/cleanup",
         "//pkg/context",
         "//pkg/control/api",
@@ -102,6 +103,7 @@ go_test(
     embed = [":control"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",

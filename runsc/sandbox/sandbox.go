@@ -974,8 +974,12 @@ func (s *Sandbox) Execute(conf *config.Config, args *controlapi.ExecArgs) (int32
 	}
 
 	// Send a message to the sandbox control server to start the container.
+	method := sentryapi.ContMgrExecuteAsync
+	if len(args.SeccompFilters) > 0 || args.UntraceableInit {
+		method = sentryapi.ContMgrExecuteAsyncWithSeccomp
+	}
 	var pid int32
-	if err := s.call(sentryapi.ContMgrExecuteAsync, args, &pid); err != nil {
+	if err := s.call(method, args, &pid); err != nil {
 		return 0, fmt.Errorf("executing command %q in sandbox: %w", args, err)
 	}
 	return pid, nil

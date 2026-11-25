@@ -18,14 +18,17 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
 func TestUser(t *testing.T) {
@@ -238,5 +241,92 @@ func TestJSONArgs(t *testing.T) {
 				t.Errorf("argsFromProcess(%+v): diff (+want -got):\n%s", tc.p, diff)
 			}
 		})
+	}
+}
+
+// TestSeccompFDs checks which --seccomp-fd descriptors runsc exec accepts, and
+// that it reads and closes them.
+func TestSeccompFDs(t *testing.T) {
+	// inherited returns a descriptor that reads data and is not
+	// close-on-exec, like a descriptor that runsc inherits.
+	inherited := func(data string) int {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		defer r.Close()
+		if _, err := w.WriteString(data); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		w.Close()
+		fd, err := unix.Dup(int(r.Fd()))
+		if err != nil {
+			t.Fatalf("dup: %v", err)
+		}
+		return fd
+	}
+	first, second := inherited("first"), inherited("second")
+	closeOnExec, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer closeOnExec.Close()
+	defer w.Close()
+
+	for _, tc := range []struct {
+		name        string
+		ex          Exec
+		errContains string
+	}{
+		{name: "NotANumber", ex: Exec{seccompFDs: stringSlice{"abc"}, execFD: -1}, errContains: `invalid --seccomp-fd "abc"`},
+		{name: "Negative", ex: Exec{seccompFDs: stringSlice{"-1"}, execFD: -1}, errContains: `invalid --seccomp-fd "-1"`},
+		{
+			// Without a 32-bit limit, this would be descriptor 1 for the kernel.
+			name:        "TooLarge",
+			ex:          Exec{seccompFDs: stringSlice{strconv.FormatInt(1<<32+1, 10)}, execFD: -1},
+			errContains: `invalid --seccomp-fd "4294967297"`,
+		},
+		{name: "Stdio", ex: Exec{seccompFDs: stringSlice{"0"}, execFD: -1}, errContains: "stdio descriptor"},
+		{name: "Repeated", ex: Exec{seccompFDs: stringSlice{strconv.Itoa(first), strconv.Itoa(first)}, execFD: -1}, errContains: "another flag uses it"},
+		{name: "ExecFD", ex: Exec{seccompFDs: stringSlice{strconv.Itoa(first)}, execFD: first}, errContains: "another flag uses it"},
+		{
+			name:        "PassFD",
+			ex:          Exec{seccompFDs: stringSlice{strconv.Itoa(first)}, execFD: -1, passFDs: []sentryapi.FDMapping{{Host: first, Guest: 3}}},
+			errContains: "another flag uses it",
+		},
+		{name: "CloseOnExec", ex: Exec{seccompFDs: stringSlice{strconv.Itoa(int(closeOnExec.Fd()))}, execFD: -1}, errContains: "bad file descriptor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.ex.parseSeccompFDs()
+			if err == nil || !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("parseSeccompFDs() = %v, want error containing %q", err, tc.errContains)
+			}
+		})
+	}
+
+	zero, err := unix.Open("/dev/zero", unix.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := readSeccompFilters([]int{zero}); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("readSeccompFilters(/dev/zero) = %v, want error containing %q", err, "larger than")
+	}
+
+	ex := Exec{seccompFDs: stringSlice{strconv.Itoa(first), strconv.Itoa(second)}, execFD: -1}
+	fds, err := ex.parseSeccompFDs()
+	if err != nil {
+		t.Fatalf("parseSeccompFDs() failed: %v", err)
+	}
+	filters, err := readSeccompFilters(fds)
+	if err != nil {
+		t.Fatalf("readSeccompFilters() failed: %v", err)
+	}
+	if diff := cmp.Diff([][]byte{[]byte("first"), []byte("second")}, filters); diff != "" {
+		t.Errorf("filters mismatch (-want +got):\n%s", diff)
+	}
+	for _, fd := range fds {
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+			t.Errorf("fd %d is still open", fd)
+		}
 	}
 }

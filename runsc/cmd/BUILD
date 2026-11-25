@@ -53,6 +53,7 @@ go_library(
     force_add_state_pkg = True,
     visibility = ["//runsc:__subpackages__"],
     deps = [
+        "//pkg/bpf",
         "//pkg/cleanup",
         "//pkg/cpuid",
         "//pkg/lisafs",

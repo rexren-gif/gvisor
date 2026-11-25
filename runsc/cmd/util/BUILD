@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -8,6 +8,7 @@ package(
 go_library(
     name = "util",
     srcs = [
+        "fd.go",
         "tpu.go",
         "util.go",
     ],
@@ -23,5 +24,14 @@ go_library(
         "//runsc/flag",
         "@com_github_google_subcommands//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "util_test",
+    size = "small",
+    srcs = ["fd_test.go"],
+    embed = [":util"],
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
 )

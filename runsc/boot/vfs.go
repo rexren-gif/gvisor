@@ -842,6 +842,118 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 	return &overlayOpts, cu.Release(), nil
 }
 
+// configureLayeredOverlay mounts the layers of submount, which is an overlay
+// mount, and returns the options to mount the overlay with. All layers must be
+// directories. Without an upper layer, a read-write overlay gets a tmpfs upper
+// layer, whose root has mode 0755 and belongs to the user of the container's
+// process. The overlay keeps its metadata in "user.overlay." extended
+// attributes, which unprivileged processes can set on host files. "cleanup"
+// must be called after the options have been used to mount the overlay, to
+// release refs on the layers.
+func (c *containerMounter) configureLayeredOverlay(ctx context.Context, spec *specs.Spec, conf *config.Config, creds *auth.Credentials, submount *mountInfo) (*vfs.MountOptions, func(), error) {
+	vfsObj := c.l.k.VFS()
+	cu := cleanup.Cleanup{}
+	defer cu.Clean()
+	// On failure, close the connections of the layers that are not mounted.
+	// getMountNameAndOptions releases the FD of each layer that it uses.
+	closeFDs := cleanup.Make(func() {
+		for _, layer := range submount.overlay.all() {
+			if layer.goferFD != nil && layer.goferFD.FD() >= 0 {
+				layer.goferFD.Close()
+			}
+		}
+	})
+	defer closeFDs.Clean()
+
+	// mountLayer mounts layer without attaching it to the mount tree.
+	mountLayer := func(layer *mountInfo, readOnly bool) (vfs.VirtualDentry, error) {
+		fsName, opts, err := getMountNameAndOptions(spec, conf, layer, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs)
+		if err != nil {
+			return vfs.VirtualDentry{}, fmt.Errorf("layer %q: %w", layer.mount.Source, err)
+		}
+		opts.ReadOnly = opts.ReadOnly || readOnly
+		mnt, err := vfsObj.MountDisconnected(ctx, creds, "" /* source */, fsName, opts)
+		if err != nil {
+			return vfs.VirtualDentry{}, fmt.Errorf("mounting layer %q: %w", layer.mount.Source, err)
+		}
+		cu.Add(func() { mnt.DecRef(ctx) })
+		vd := vfs.MakeVirtualDentry(mnt, mnt.Root())
+		mode, err := c.getPathMode(ctx, creds, &vfs.PathOperation{Root: vd, Start: vd})
+		if err != nil {
+			return vfs.VirtualDentry{}, fmt.Errorf("layer %q: %w", layer.mount.Source, err)
+		}
+		if !mode.IsDir() {
+			return vfs.VirtualDentry{}, fmt.Errorf("layer %q: %w", layer.mount.Source, linuxerr.ENOTDIR)
+		}
+		return vd, nil
+	}
+
+	// The overlay wants the top lower layer first.
+	layers := submount.overlay
+	lowerRoots := make([]vfs.VirtualDentry, len(layers.lowers))
+	for i, layer := range layers.lowers {
+		vd, err := mountLayer(layer, true /* readOnly */)
+		if err != nil {
+			return nil, nil, err
+		}
+		lowerRoots[len(lowerRoots)-1-i] = vd
+	}
+
+	_, rest, err := specutils.OverlayLayersOf(*submount.mount)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts := ParseMountOptions(rest)
+
+	var upperRoot vfs.VirtualDentry
+	switch {
+	case layers.upper != nil:
+		if upperRoot, err = mountLayer(layers.upper, false /* readOnly */); err != nil {
+			return nil, nil, err
+		}
+	case !opts.ReadOnly:
+		upperOpts := &vfs.MountOptions{
+			GetFilesystemOptions: vfs.GetFilesystemOptions{
+				InternalMount: true,
+				InternalData: tmpfs.FilesystemOpts{
+					RootFileType:            linux.S_IFDIR,
+					DisableDefaultSizeLimit: true,
+					TarNanosecondTimestamps: conf.TarTimestampResolution == config.TarTimestampNanoseconds,
+				},
+			},
+		}
+		upper, err := vfsObj.MountDisconnected(ctx, creds, "" /* source */, tmpfs.Name, upperOpts)
+		if err != nil {
+			return nil, nil, fmt.Errorf("creating tmpfs upper layer: %w", err)
+		}
+		cu.Add(func() { upper.DecRef(ctx) })
+		upperRoot = vfs.MakeVirtualDentry(upper, upper.Root())
+		stat := linux.Statx{Mask: linux.STATX_MODE, Mode: linux.S_IFDIR | 0755}
+		if spec.Process != nil {
+			uid := creds.UserNamespace.MapToKUID(auth.UID(spec.Process.User.UID))
+			gid := creds.UserNamespace.MapToKGID(auth.GID(spec.Process.User.GID))
+			if uid.Ok() && gid.Ok() {
+				stat.Mask |= linux.STATX_UID | linux.STATX_GID
+				stat.UID, stat.GID = uint32(uid), uint32(gid)
+			}
+		}
+		if err := vfsObj.SetStatAt(ctx, creds, &vfs.PathOperation{Root: upperRoot, Start: upperRoot}, &vfs.SetStatOptions{Stat: stat}); err != nil {
+			return nil, nil, fmt.Errorf("setting owner and mode of tmpfs upper layer: %w", err)
+		}
+	}
+
+	opts.GetFilesystemOptions = vfs.GetFilesystemOptions{
+		InternalMount: true,
+		Data:          "userxattr",
+		InternalData: overlay.FilesystemOptions{
+			UpperRoot:  upperRoot,
+			LowerRoots: lowerRoots,
+		},
+	}
+	closeFDs.Release()
+	return opts, cu.Release(), nil
+}
+
 func (c *containerMounter) mountSubmounts(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials, timeline *timing.Timeline) error {
 	mounts, err := c.prepareMounts()
 	if err != nil {
@@ -923,6 +1035,28 @@ type mountInfo struct {
 	hint           *sentryapi.MountHint
 	goferMountConf specutils.GoferMountConf
 	filestoreFD    *fd.FD
+
+	// overlay holds the layers of an overlay mount, or nil for any other
+	// mount.
+	overlay *overlayLayers
+}
+
+// overlayLayers holds the mounts that make the layers of an overlay mount.
+type overlayLayers struct {
+	// lowers are the read-only layers, from the bottom layer to the top layer.
+	lowers []*mountInfo
+
+	// upper is the writable layer, or nil. When it is nil and the overlay is
+	// not read-only, a tmpfs is the writable layer.
+	upper *mountInfo
+}
+
+// all returns the lower layers and the upper layer, if any.
+func (o *overlayLayers) all() []*mountInfo {
+	if o.upper == nil {
+		return o.lowers
+	}
+	return append(slices.Clone(o.lowers), o.upper)
 }
 
 func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
@@ -962,12 +1096,107 @@ func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
 		return nil, err
 	}
 
-	// Sort the mounts so that we don't place children before parents.
-	sort.Slice(mounts, func(i, j int) bool {
+	mounts, err := groupOverlayLayers(mounts)
+	if err != nil {
+		return nil, err
+	}
+	sortMounts(mounts)
+	return mounts, nil
+}
+
+// sortMounts sorts mounts so that we don't place children before parents.
+// Mounts with destinations of the same length keep their order, so that a
+// mount hides an earlier mount at the same destination.
+func sortMounts(mounts []mountInfo) {
+	sort.SliceStable(mounts, func(i, j int) bool {
 		return len(mounts[i].mount.Destination) < len(mounts[j].mount.Destination)
 	})
+}
 
-	return mounts, nil
+// isAtOrAbove reports whether the absolute path dir is path or one of its
+// parents.
+func isAtOrAbove(dir, path string) bool {
+	dir, path = filepath.Clean(dir), filepath.Clean(path)
+	return dir == path || dir == "/" || strings.HasPrefix(path, dir+"/")
+}
+
+// groupOverlayLayers moves the mounts that are layers of an overlay mount
+// from mounts into the overlay mount. A layer is the mount before the overlay
+// mount whose destination is the one that the overlay mount names.
+// It must be a bind mount that the gofer serves as is, and only one overlay
+// mount can use it. The gofer mounts each layer at its destination in the
+// root filesystem, so an earlier tmpfs mount at "/" must hide it, and no
+// other mount can be at, above or below it.
+func groupOverlayLayers(mounts []mountInfo) ([]mountInfo, error) {
+	isLayer := make([]bool, len(mounts))
+	for i := range mounts {
+		m := &mounts[i]
+		layers, _, err := specutils.OverlayLayersOf(*m.mount)
+		if err != nil {
+			return nil, err
+		}
+		if layers == nil {
+			continue
+		}
+		find := func(dst string) (*mountInfo, error) {
+			for j := i - 1; j >= 0; j-- {
+				l := &mounts[j]
+				if l.mount.Destination != dst {
+					continue
+				}
+				if isLayer[j] {
+					return nil, fmt.Errorf("overlay mount at %q: layer %q is a layer of another overlay mount", m.mount.Destination, dst)
+				}
+				if l.mount.Type != sentryapi.Bind || l.goferFD == nil || !l.goferMountConf.ShouldUseLisafs() || l.goferMountConf.ShouldUseOverlayfs() || l.hint != nil {
+					return nil, fmt.Errorf("overlay mount at %q: layer %q must be a bind mount without a mount hint or an overlay", m.mount.Destination, dst)
+				}
+				hidden := false
+				for k := range mounts {
+					o := mounts[k].mount
+					if k == j || !(isAtOrAbove(o.Destination, dst) || isAtOrAbove(dst, o.Destination)) {
+						continue
+					}
+					if filepath.Clean(o.Destination) != "/" || o.Type != tmpfs.Name {
+						return nil, fmt.Errorf("overlay mount at %q: mount at %q overlaps layer %q", m.mount.Destination, o.Destination, dst)
+					}
+					hidden = hidden || k < j
+				}
+				if !hidden {
+					return nil, fmt.Errorf("overlay mount at %q: no earlier tmpfs mount at \"/\" hides layer %q", m.mount.Destination, dst)
+				}
+				isLayer[j] = true
+				return l, nil
+			}
+			return nil, fmt.Errorf("overlay mount at %q: no earlier mount at layer %q", m.mount.Destination, dst)
+		}
+		m.overlay = &overlayLayers{}
+		for _, dst := range layers.Lowers {
+			l, err := find(dst)
+			if err != nil {
+				return nil, err
+			}
+			// The gofer must also keep the lower layers read-only.
+			if !specutils.IsReadonlyMount(l.mount.Options) {
+				return nil, fmt.Errorf("overlay mount at %q: lower layer %q is not read-only", m.mount.Destination, dst)
+			}
+			m.overlay.lowers = append(m.overlay.lowers, l)
+		}
+		if layers.Upper != "" {
+			if m.overlay.upper, err = find(layers.Upper); err != nil {
+				return nil, err
+			}
+			if specutils.IsReadonlyMount(m.overlay.upper.mount.Options) {
+				return nil, fmt.Errorf("overlay mount at %q: upper layer %q is read-only", m.mount.Destination, layers.Upper)
+			}
+		}
+	}
+	grouped := make([]mountInfo, 0, len(mounts))
+	for i := range mounts {
+		if !isLayer[i] {
+			grouped = append(grouped, mounts[i])
+		}
+	}
+	return grouped, nil
 }
 
 // getPathMode returns file mode for the specified path.
@@ -985,9 +1214,24 @@ func (c *containerMounter) getPathMode(ctx context.Context, creds *auth.Credenti
 }
 
 func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *mountInfo) (*vfs.Mount, error) {
-	fsName, opts, err := getMountNameAndOptions(spec, conf, submount, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs)
-	if err != nil {
-		return nil, fmt.Errorf("mountOptions failed: %w", err)
+	var (
+		fsName string
+		opts   *vfs.MountOptions
+		err    error
+	)
+	if submount.overlay != nil {
+		var cleanup func()
+		opts, cleanup, err = c.configureLayeredOverlay(ctx, spec, conf, creds, submount)
+		if err != nil {
+			return nil, fmt.Errorf("configuring overlay at %q: %w", submount.mount.Destination, err)
+		}
+		defer cleanup()
+		fsName = overlay.Name
+	} else {
+		fsName, opts, err = getMountNameAndOptions(spec, conf, submount, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs)
+		if err != nil {
+			return nil, fmt.Errorf("mountOptions failed: %w", err)
+		}
 	}
 	if len(fsName) == 0 {
 		// Filesystem is not supported (e.g. cgroup), just skip it.
@@ -1814,6 +2058,12 @@ func (c *containerMounter) configureRestore(restoreMnts *restoreMounts) error {
 		key := checkpoint.ResourceID{ContainerName: c.containerName, Path: submount.mount.Destination}
 		if submount.goferFD != nil {
 			restoreMnts.fdmap[key] = submount.goferFD.Release()
+		}
+		if submount.overlay != nil {
+			for _, layer := range submount.overlay.all() {
+				layerKey := checkpoint.ResourceID{ContainerName: c.containerName, Path: layer.mount.Destination}
+				restoreMnts.fdmap[layerKey] = layer.goferFD.Release()
+			}
 		}
 		if submount.filestoreFD != nil {
 			mf, loaded, err := createPrivateMemoryFile(submount.filestoreFD.ReleaseToFile("overlay-filestore"), key, c.containerID, c.l.fsRestore)

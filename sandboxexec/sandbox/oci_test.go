@@ -16,6 +16,7 @@ package sandbox_test
 
 import (
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -207,6 +208,219 @@ func TestSpecMountMode(t *testing.T) {
 			}
 			if !slices.Contains(opts, tc.wantOpt) {
 				t.Errorf("mount options = %v, want it to contain %q", opts, tc.wantOpt)
+			}
+		})
+	}
+}
+
+// overlayOpts are the options that leave only the given mounts in the spec,
+// after a tmpfs at "/".
+func overlayOpts(mounts ...sandbox.Mount) []sandbox.Option {
+	return []sandbox.Option{
+		sandbox.WithoutLinuxSystemMounts(),
+		sandbox.WithoutHostBinaryMounts(),
+		sandbox.WithMount(append([]sandbox.Mount{{Destination: "/", Type: sandbox.MountTypeTmpfs}}, mounts...)...),
+	}
+}
+
+func TestSpecOverlay(t *testing.T) {
+	tests := []struct {
+		name  string
+		mount sandbox.Mount
+		want  []specs.Mount
+	}{
+		{
+			name:  "Memory",
+			mount: sandbox.Mount{Destination: "/mnt/", Type: sandbox.MountTypeOverlay, Lowers: []string{"/host/a"}},
+			want: []specs.Mount{
+				{Destination: "/.gvisor-overlay/1/0", Source: "/host/a", Type: "bind", Options: []string{"ro", "nosuid", "nodev"}},
+				{Destination: "/mnt", Source: "overlay", Type: "overlay", Options: []string{"dev.gvisor.overlay.lower=/.gvisor-overlay/1/0"}},
+			},
+		},
+		{
+			name:  "ReadOnly",
+			mount: sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: []string{"/host/a", "/host/b/"}, ReadOnly: true},
+			want: []specs.Mount{
+				{Destination: "/.gvisor-overlay/1/0", Source: "/host/a", Type: "bind", Options: []string{"ro", "nosuid", "nodev"}},
+				{Destination: "/.gvisor-overlay/1/1", Source: "/host/b", Type: "bind", Options: []string{"ro", "nosuid", "nodev"}},
+				{Destination: "/mnt", Source: "overlay", Type: "overlay", Options: []string{
+					"ro",
+					"dev.gvisor.overlay.lower=/.gvisor-overlay/1/0",
+					"dev.gvisor.overlay.lower=/.gvisor-overlay/1/1",
+				}},
+			},
+		},
+		{
+			name:  "NoSuidNoDev",
+			mount: sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: []string{"/host/a"}, NoSuid: true, NoDev: true},
+			want: []specs.Mount{
+				{Destination: "/.gvisor-overlay/1/0", Source: "/host/a", Type: "bind", Options: []string{"ro", "nosuid", "nodev"}},
+				{Destination: "/mnt", Source: "overlay", Type: "overlay", Options: []string{
+					"nosuid",
+					"nodev",
+					"dev.gvisor.overlay.lower=/.gvisor-overlay/1/0",
+				}},
+			},
+		},
+		{
+			name:  "Upper",
+			mount: sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: []string{"/host/a"}, Upper: "/host/rw"},
+			want: []specs.Mount{
+				{Destination: "/.gvisor-overlay/1/0", Source: "/host/a", Type: "bind", Options: []string{"ro", "nosuid", "nodev"}},
+				{Destination: "/.gvisor-overlay/1/upper", Source: "/host/rw", Type: "bind", Options: []string{"nosuid", "nodev"}},
+				{Destination: "/mnt", Source: "overlay", Type: "overlay", Options: []string{
+					"dev.gvisor.overlay.lower=/.gvisor-overlay/1/0",
+					"dev.gvisor.overlay.upper=/.gvisor-overlay/1/upper",
+				}},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := sandbox.DebugSpec(overlayOpts(tc.mount)...)
+			if err != nil {
+				t.Fatalf("DebugSpec failed: %v", err)
+			}
+			want := append([]specs.Mount{{Destination: "/", Type: "tmpfs"}}, tc.want...)
+			if !reflect.DeepEqual(spec.Mounts, want) {
+				t.Errorf("spec.Mounts = %+v, want %+v", spec.Mounts, want)
+			}
+		})
+	}
+}
+
+func TestSpecOverlayErrors(t *testing.T) {
+	layers := []string{"/host/a", "/host/b"}
+	tests := []struct {
+		name    string
+		opts    []sandbox.Option
+		wantErr string
+	}{
+		{
+			name:    "NoLayers",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay}),
+			wantErr: "has no layers",
+		},
+		{
+			name:    "EmptyLayer",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: []string{""}}),
+			wantErr: "empty layer",
+		},
+		{
+			name:    "ReadOnlyOneLayer",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers[:1], ReadOnly: true}),
+			wantErr: "needs 2 or more layers",
+		},
+		{
+			name:    "ReadOnlyUpper",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers, Upper: "/host/rw", ReadOnly: true}),
+			wantErr: "cannot have an upper directory",
+		},
+		{
+			name:    "Source",
+			opts:    overlayOpts(sandbox.Mount{Source: "/host/x", Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers}),
+			wantErr: "cannot have a source",
+		},
+		{
+			name:    "AtRoot",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/", Type: sandbox.MountTypeOverlay, Lowers: layers}),
+			wantErr: `cannot be at "/"`,
+		},
+		{
+			name: "NoTmpfsRoot",
+			opts: []sandbox.Option{
+				sandbox.WithMount(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers}),
+			},
+			wantErr: "needs an earlier tmpfs mount",
+		},
+		{
+			name: "TmpfsRootAfter",
+			opts: []sandbox.Option{
+				sandbox.WithMount(
+					sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers},
+					sandbox.Mount{Destination: "/", Type: sandbox.MountTypeTmpfs},
+				),
+			},
+			wantErr: "needs an earlier tmpfs mount",
+		},
+		{
+			name: "HostRoot",
+			opts: append(overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers}),
+				sandbox.WithRootfs("/", true)),
+			wantErr: "default root filesystem",
+		},
+		{
+			name: "BindAtRoot",
+			opts: overlayOpts(
+				sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers},
+				sandbox.Mount{Source: "/", Destination: "/", Type: sandbox.MountTypeBind},
+			),
+			wantErr: "to be a tmpfs",
+		},
+		{
+			name: "MountInLayerDir",
+			opts: overlayOpts(
+				sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers},
+				sandbox.Mount{Destination: "/.gvisor-overlay/x", Type: sandbox.MountTypeTmpfs},
+			),
+			wantErr: "which overlay mounts use",
+		},
+		{
+			name:    "Mode",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers, Mode: modePtr(0700)}),
+			wantErr: "cannot have a source, a mode",
+		},
+		{
+			name:    "Recursive",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers, Recursive: true}),
+			wantErr: "cannot have a source, a mode",
+		},
+		{
+			name:    "RelativeLayer",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: []string{"host/a"}}),
+			wantErr: "not an absolute path",
+		},
+		{
+			name:    "RelativeUpper",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers, Upper: "rw"}),
+			wantErr: "not an absolute path",
+		},
+		{
+			name:    "UpperIsLayer",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers, Upper: "/host/b/"}),
+			wantErr: "both a layer and the upper directory",
+		},
+		{
+			name:    "CleansToRoot",
+			opts:    overlayOpts(sandbox.Mount{Destination: "/mnt/..", Type: sandbox.MountTypeOverlay, Lowers: layers}),
+			wantErr: `cannot be at "/"`,
+		},
+		{
+			name: "MountAtLayerDir",
+			opts: overlayOpts(
+				sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers},
+				sandbox.Mount{Destination: "/.gvisor-overlay", Type: sandbox.MountTypeTmpfs},
+			),
+			wantErr: "which overlay mounts use",
+		},
+		{
+			name:    "LayersOnBind",
+			opts:    overlayOpts(sandbox.Mount{Source: "/host/x", Destination: "/mnt", Type: sandbox.MountTypeBind, Lowers: layers}),
+			wantErr: "only overlay mounts can have",
+		},
+	}
+	// A path that only starts with the name of the layer directory is fine.
+	if _, err := sandbox.DebugSpec(overlayOpts(
+		sandbox.Mount{Destination: "/mnt", Type: sandbox.MountTypeOverlay, Lowers: layers},
+		sandbox.Mount{Destination: "/.gvisor-overlayx", Type: sandbox.MountTypeTmpfs},
+	)...); err != nil {
+		t.Errorf("DebugSpec() with a mount at /.gvisor-overlayx failed: %v", err)
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := sandbox.DebugSpec(tc.opts...)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("DebugSpec() = %v, want error containing %q", err, tc.wantErr)
 			}
 		})
 	}

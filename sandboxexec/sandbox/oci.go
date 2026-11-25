@@ -18,10 +18,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // defaultInitArgs is the placeholder init that keeps the sandbox alive for
@@ -100,12 +104,134 @@ func (t MountType) ociType() (string, error) {
 		return "devpts", nil
 	case MountTypeCgroup:
 		return "cgroupfs", nil
+	case MountTypeOverlay:
+		return "overlay", nil
 	}
 	return "", fmt.Errorf("unknown mount type %d", t)
 }
 
+// overlayLayerDir is the directory of the root filesystem where the sandbox
+// mounts the layers of its overlay mounts for the gofer. An earlier tmpfs at
+// "/" keeps it out of the sandbox's view, and the sandbox does not mount the
+// layers there.
+const overlayLayerDir = "/.gvisor-overlay"
+
+// ociOverlayMounts converts m, the i-th MountTypeOverlay mount, into the OCI
+// mount entries of its layers, followed by the entry of the overlay.
+func (m Mount) ociOverlayMounts(i int) ([]specs.Mount, error) {
+	if m.Source != "" || m.Mode != nil || m.Recursive || m.Private {
+		return nil, fmt.Errorf("overlay mount at %q cannot have a source, a mode, or the recursive or private flags", m.Destination)
+	}
+	if len(m.Lowers) == 0 {
+		return nil, fmt.Errorf("overlay mount at %q has no layers", m.Destination)
+	}
+	if m.ReadOnly && m.Upper != "" {
+		return nil, fmt.Errorf("read-only overlay mount at %q cannot have an upper directory", m.Destination)
+	}
+	if m.ReadOnly && len(m.Lowers) < 2 {
+		return nil, fmt.Errorf("read-only overlay mount at %q needs 2 or more layers", m.Destination)
+	}
+	dir := path.Join(overlayLayerDir, strconv.Itoa(i))
+	var mounts []specs.Mount
+	var opts []string
+	for _, o := range []struct {
+		set  bool
+		name string
+	}{
+		{m.NoSuid, "nosuid"},
+		{m.NoDev, "nodev"},
+		{m.ReadOnly, "ro"},
+	} {
+		if o.set {
+			opts = append(opts, o.name)
+		}
+	}
+	if m.Upper != "" && !filepath.IsAbs(m.Upper) {
+		return nil, fmt.Errorf("overlay mount at %q has upper directory %q, which is not an absolute path", m.Destination, m.Upper)
+	}
+	for j, layer := range m.Lowers {
+		if layer == "" {
+			return nil, fmt.Errorf("overlay mount at %q has an empty layer", m.Destination)
+		}
+		if !filepath.IsAbs(layer) {
+			return nil, fmt.Errorf("overlay mount at %q has layer %q, which is not an absolute path", m.Destination, layer)
+		}
+		if m.Upper != "" && filepath.Clean(layer) == filepath.Clean(m.Upper) {
+			return nil, fmt.Errorf("overlay mount at %q has %q as both a layer and the upper directory", m.Destination, layer)
+		}
+		dst := path.Join(dir, strconv.Itoa(j))
+		mounts = append(mounts, specs.Mount{
+			Destination: dst,
+			Source:      filepath.Clean(layer),
+			Type:        "bind",
+			Options:     []string{"ro", "nosuid", "nodev"},
+		})
+		opts = append(opts, specutils.OverlayLowerOption+"="+dst)
+	}
+	if m.Upper != "" {
+		dst := path.Join(dir, "upper")
+		mounts = append(mounts, specs.Mount{
+			Destination: dst,
+			Source:      filepath.Clean(m.Upper),
+			Type:        "bind",
+			Options:     []string{"nosuid", "nodev"},
+		})
+		opts = append(opts, specutils.OverlayUpperOption+"="+dst)
+	}
+	fsType, err := m.Type.ociType()
+	if err != nil {
+		return nil, err
+	}
+	return append(mounts, specs.Mount{
+		Destination: filepath.Clean(m.Destination),
+		Source:      fsType,
+		Type:        fsType,
+		Options:     opts,
+	}), nil
+}
+
+// checkOverlayMounts reports an error if the mounts of cfg do not meet the
+// needs of MountTypeOverlay.
+func checkOverlayMounts(cfg bundleConfig) error {
+	hasOverlay := slices.ContainsFunc(cfg.Mounts, func(m Mount) bool { return m.Type == MountTypeOverlay })
+	if !hasOverlay {
+		return nil
+	}
+	if cfg.RootPath != "" {
+		return fmt.Errorf("overlay mounts need the default root filesystem")
+	}
+	tmpfsRoot := false
+	for _, m := range cfg.Mounts {
+		dst := filepath.Clean(m.Destination)
+		if m.Type == MountTypeOverlay {
+			if dst == "/" {
+				return fmt.Errorf("overlay mount cannot be at \"/\"")
+			}
+			if !tmpfsRoot {
+				return fmt.Errorf("overlay mount at %q needs an earlier tmpfs mount at \"/\"", dst)
+			}
+		}
+		if dst == "/" {
+			if m.Type != MountTypeTmpfs {
+				return fmt.Errorf("overlay mounts need every mount at \"/\" to be a tmpfs")
+			}
+			tmpfsRoot = true
+		}
+		if dst == overlayLayerDir || strings.HasPrefix(dst, overlayLayerDir+"/") {
+			return fmt.Errorf("mount at %q is in %q, which overlay mounts use", dst, overlayLayerDir)
+		}
+	}
+	return nil
+}
+
 // ociMount converts m into an OCI mount entry.
 func (m Mount) ociMount() (specs.Mount, error) {
+	if m.Type == MountTypeOverlay {
+		return specs.Mount{}, fmt.Errorf("overlay mount at %q converts to more than one OCI mount", m.Destination)
+	}
+	if len(m.Lowers) > 0 || m.Upper != "" {
+		return specs.Mount{}, fmt.Errorf("mount at %q has layers or an upper directory, which only overlay mounts can have", m.Destination)
+	}
 	fsType, err := m.Type.ociType()
 	if err != nil {
 		return specs.Mount{}, err
@@ -238,7 +364,18 @@ func newSpec(cfg bundleConfig) (*specs.Spec, error) {
 
 	// Add custom mounts. Custom mounts overriding default host mounts create duplicate OCI
 	// entries. The later entry overrides the earlier one, as expected by OCI specs.
-	for _, m := range cfg.Mounts {
+	if err := checkOverlayMounts(cfg); err != nil {
+		return nil, err
+	}
+	for i, m := range cfg.Mounts {
+		if m.Type == MountTypeOverlay {
+			oms, err := m.ociOverlayMounts(i)
+			if err != nil {
+				return nil, err
+			}
+			spec.Mounts = append(spec.Mounts, oms...)
+			continue
+		}
 		om, err := m.ociMount()
 		if err != nil {
 			return nil, err

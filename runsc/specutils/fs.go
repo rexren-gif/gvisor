@@ -20,6 +20,7 @@ import (
 	"path"
 	"slices"
 	"sort"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -129,7 +130,95 @@ func validateMount(mnt *specs.Mount) error {
 	if IsGoferMount(*mnt) {
 		return ValidateMountOptions(mnt.Options)
 	}
+	if _, _, err := OverlayLayersOf(*mnt); err != nil {
+		return err
+	}
 	return nil
+}
+
+const (
+	// OverlayLowerOption is an option of a mount of type "overlay". Its value
+	// is the destination of an earlier bind mount in the same spec, which
+	// becomes a read-only layer of the overlay. Give it once for each layer,
+	// from the bottom layer to the top layer. runsc mounts the layer mounts
+	// of an overlay only as its layers, but the gofer still mounts them at
+	// their destinations in the root filesystem. So an earlier tmpfs mount at
+	// "/" must hide them, no other mount can be at, above or below them, and
+	// their destinations must not go through symlinks in the root
+	// filesystem.
+	OverlayLowerOption = "dev.gvisor.overlay.lower"
+
+	// OverlayUpperOption is an option of a mount of type "overlay". Its value
+	// is the destination of an earlier mount in the same spec, which receives
+	// the changes made in the overlay. Without it, the changes stay in memory,
+	// or fail with EROFS if the overlay is read-only.
+	OverlayUpperOption = "dev.gvisor.overlay.upper"
+)
+
+// OverlayLayers holds the layers of an overlay mount, by the destinations of
+// the mounts that supply them.
+type OverlayLayers struct {
+	// Lowers are the read-only layers, from the bottom layer to the top layer.
+	Lowers []string
+
+	// Upper is the writable layer, or "" if the overlay has none.
+	Upper string
+}
+
+// OverlayLayersOf returns the layers of m and the rest of its options. If m is
+// not an overlay mount with OverlayLowerOption, OverlayLayersOf returns nil
+// layers and m.Options. runsc does not mount such overlay mounts.
+func OverlayLayersOf(m specs.Mount) (*OverlayLayers, []string, error) {
+	if m.Type != "overlay" {
+		return nil, m.Options, nil
+	}
+	var (
+		layers   OverlayLayers
+		rest     []string
+		hasUpper bool
+	)
+	for _, o := range m.Options {
+		key, val, _ := strings.Cut(o, "=")
+		switch key {
+		case OverlayLowerOption:
+			layers.Lowers = append(layers.Lowers, val)
+		case OverlayUpperOption:
+			if hasUpper {
+				return nil, nil, fmt.Errorf("overlay mount at %q has more than one %s option", m.Destination, OverlayUpperOption)
+			}
+			hasUpper = true
+			layers.Upper = val
+		default:
+			rest = append(rest, o)
+		}
+	}
+	if len(layers.Lowers) == 0 {
+		if hasUpper {
+			return nil, nil, fmt.Errorf("overlay mount at %q has a %s option but no %s option", m.Destination, OverlayUpperOption, OverlayLowerOption)
+		}
+		return nil, m.Options, nil
+	}
+	all := layers.Lowers
+	if hasUpper {
+		all = append(slices.Clone(all), layers.Upper)
+	}
+	for i, l := range all {
+		if !path.IsAbs(l) || path.Clean(l) != l {
+			return nil, nil, fmt.Errorf("overlay mount at %q has layer %q, which is not a clean absolute path", m.Destination, l)
+		}
+		if slices.Contains(all[:i], l) {
+			return nil, nil, fmt.Errorf("overlay mount at %q uses layer %q more than once", m.Destination, l)
+		}
+	}
+	if IsReadonlyMount(rest) {
+		if hasUpper {
+			return nil, nil, fmt.Errorf("read-only overlay mount at %q cannot have a %s option", m.Destination, OverlayUpperOption)
+		}
+		if len(layers.Lowers) < 2 {
+			return nil, nil, fmt.Errorf("read-only overlay mount at %q needs 2 or more %s options", m.Destination, OverlayLowerOption)
+		}
+	}
+	return &layers, rest, nil
 }
 
 // FilterMountOptions filters out all invalid mount options.

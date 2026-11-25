@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -62,6 +63,10 @@ const (
 	flagDir           = "dir"
 	flagAsPID1        = "as-pid-1"
 	flagDev           = "dev"
+	flagOverlaySrc    = "overlay-src"
+	flagOverlay       = "overlay"
+	flagTmpOverlay    = "tmp-overlay"
+	flagRoOverlay     = "ro-overlay"
 )
 
 // Cli implements subcommands.Command for the "bwrap" command.
@@ -94,6 +99,10 @@ type Cli struct {
 	dir           string
 	asPID1        bool
 	dev           string
+	overlaySrc    string
+	overlay       string
+	tmpOverlay    string
+	roOverlay     string
 }
 
 // Name implements subcommands.Command.Name.
@@ -140,6 +149,10 @@ func (c *Cli) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.dir, flagDir, "", "Create dir at DEST")
 	f.BoolVar(&c.asPID1, flagAsPID1, false, "Do not install a reaper process with PID=1")
 	f.StringVar(&c.dev, flagDev, "", "Mount new dev on DEST")
+	f.StringVar(&c.overlaySrc, flagOverlaySrc, "", "Add SRC as an overlay layer")
+	f.StringVar(&c.overlay, flagOverlay, "", "Mount an overlay at DEST that writes changes to RWSRC (args: RWSRC WORKDIR DEST)")
+	f.StringVar(&c.tmpOverlay, flagTmpOverlay, "", "Mount an overlay at DEST that keeps changes in memory")
+	f.StringVar(&c.roOverlay, flagRoOverlay, "", "Mount a read-only overlay at DEST")
 
 	// Override the default usage function to print the custom usage message.
 	f.Usage = func() {
@@ -170,6 +183,12 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 		// --perms only modifies the operation that immediately follows it.
 		if cfg.nextPerms != nil && (!strings.HasPrefix(arg, "--") || !acceptsPerms(strings.TrimPrefix(arg, "--"))) {
 			return nil, fmt.Errorf("bwrap: --%s must be followed by an option that creates a file", flagPerms)
+		}
+
+		// The --overlay-src layers go only to the overlay option right after
+		// them.
+		if len(cfg.overlaySrcs) > 0 && !isOverlayFlag(arg) {
+			return nil, errOverlaySrcUnused
 		}
 
 		// Bwrap passes the rest of the arguments to the command.
@@ -237,12 +256,24 @@ func parseBwrapArgs(bwrapArgs []string) (*bwrapConfig, error) {
 			i, err = cfg.parseAsPID1(bwrapArgs, i)
 		case flagDev:
 			i, err = cfg.parseDev(bwrapArgs, i)
+		case flagOverlaySrc:
+			i, err = cfg.parseOverlaySrc(bwrapArgs, i)
+		case flagOverlay:
+			i, err = cfg.parseOverlay(bwrapArgs, i)
+		case flagTmpOverlay:
+			i, err = cfg.parseTmpOverlay(bwrapArgs, i)
+		case flagRoOverlay:
+			i, err = cfg.parseRoOverlay(bwrapArgs, i)
 		default:
 			return nil, fmt.Errorf("bwrap: Unknown option: %s", arg)
 		}
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	if len(cfg.overlaySrcs) > 0 {
+		return nil, errOverlaySrcUnused
 	}
 
 	cfg.resolveEnv()
@@ -481,6 +512,196 @@ func (c *bwrapConfig) parseDev(args []string, i int) (int, error) {
 	c.Mounts = append(c.Mounts, dev, pts)
 
 	return i + 2, nil
+}
+
+// errOverlaySrcUnused reports --overlay-src layers that no overlay option
+// takes.
+var errOverlaySrcUnused = fmt.Errorf("bwrap: no overlay option takes the --%s layers; put --%s, --%s or --%s directly after them", flagOverlaySrc, flagOverlay, flagTmpOverlay, flagRoOverlay)
+
+// isOverlayFlag reports whether arg is --overlay-src or an option that mounts
+// the --overlay-src layers.
+func isOverlayFlag(arg string) bool {
+	switch arg {
+	case "--" + flagOverlaySrc, "--" + flagOverlay, "--" + flagTmpOverlay, "--" + flagRoOverlay:
+		return true
+	}
+	return false
+}
+
+// parseOverlaySrc handles --overlay-src SRC. In the overlay that the next
+// overlay option mounts, SRC goes on top of the layers given before it.
+func (c *bwrapConfig) parseOverlaySrc(args []string, i int) (int, error) {
+	if i+1 >= len(args) {
+		return i, fmt.Errorf("bwrap: --%s takes 1 argument", flagOverlaySrc)
+	}
+	src, err := hostDir(args[i+1])
+	if err != nil {
+		return i, err
+	}
+	c.overlaySrcs = append(c.overlaySrcs, src)
+	return i + 2, nil
+}
+
+// parseOverlay handles --overlay RWSRC WORKDIR DEST. The changes made in the
+// overlay go to RWSRC. runsc does not use WORKDIR, but it must be a directory
+// that does not overlap RWSRC, and that is not a layer or above one.
+func (c *bwrapConfig) parseOverlay(args []string, i int) (int, error) {
+	if i+3 >= len(args) {
+		return i, fmt.Errorf("bwrap: --%s takes 3 arguments", flagOverlay)
+	}
+	upper, err := hostDir(args[i+1])
+	if err != nil {
+		return i, err
+	}
+	work, err := hostDir(args[i+2])
+	if err != nil {
+		return i, err
+	}
+	resolved, err := resolveDirs(append([]string{work, upper}, c.overlaySrcs...))
+	if err != nil {
+		return i, err
+	}
+	rWork, rUpper := resolved[0], resolved[1]
+	if contains(rWork, rUpper) || contains(rUpper, rWork) {
+		return i, fmt.Errorf("bwrap: --%s: WORKDIR %s and RWSRC %s overlap", flagOverlay, work, upper)
+	}
+	for j, rLower := range resolved[2:] {
+		if contains(rWork, rLower) {
+			return i, fmt.Errorf("bwrap: --%s: WORKDIR %s is or contains the layer %s", flagOverlay, work, c.overlaySrcs[j])
+		}
+	}
+	mnt, err := c.newOverlay(flagOverlay, args[i+3], 1, upper)
+	if err != nil {
+		return i, err
+	}
+	c.Mounts = append(c.Mounts, mnt)
+	return i + 4, nil
+}
+
+// parseTmpOverlay handles --tmp-overlay DEST. The changes made in the overlay
+// stay in sandbox memory.
+func (c *bwrapConfig) parseTmpOverlay(args []string, i int) (int, error) {
+	if i+1 >= len(args) {
+		return i, fmt.Errorf("bwrap: --%s takes 1 argument", flagTmpOverlay)
+	}
+	mnt, err := c.newOverlay(flagTmpOverlay, args[i+1], 1, "" /* upper */)
+	if err != nil {
+		return i, err
+	}
+	c.Mounts = append(c.Mounts, mnt)
+	return i + 2, nil
+}
+
+// parseRoOverlay handles --ro-overlay DEST. Writes to the overlay fail with
+// EROFS.
+func (c *bwrapConfig) parseRoOverlay(args []string, i int) (int, error) {
+	if i+1 >= len(args) {
+		return i, fmt.Errorf("bwrap: --%s takes 1 argument", flagRoOverlay)
+	}
+	mnt, err := c.newOverlay(flagRoOverlay, args[i+1], 2, "" /* upper */)
+	if err != nil {
+		return i, err
+	}
+	mnt.ReadOnly = true
+	c.Mounts = append(c.Mounts, mnt)
+	return i + 2, nil
+}
+
+// newOverlay returns an overlay mount at dst of the --overlay-src layers given
+// since the last overlay option, from the first one at the bottom to the last
+// one at the top, and of the upper directory upper, if any. The overlay option
+// flag needs at least minLayers layers. The overlay ignores set-user-ID bits.
+func (c *bwrapConfig) newOverlay(flag, dst string, minLayers int, upper string) (sandbox.Mount, error) {
+	if len(c.overlaySrcs) < minLayers {
+		return sandbox.Mount{}, fmt.Errorf("bwrap: --%s needs %d or more --%s options directly before it", flag, minLayers, flagOverlaySrc)
+	}
+	dirs := c.overlaySrcs
+	if upper != "" {
+		dirs = append(slices.Clone(dirs), upper)
+	}
+	// Mount the paths that the check sees.
+	resolved, err := checkNoOverlap(flag, dirs)
+	if err != nil {
+		return sandbox.Mount{}, err
+	}
+	lowers := resolved[:len(c.overlaySrcs)]
+	if upper != "" {
+		upper = resolved[len(c.overlaySrcs)]
+	}
+	if dst == "" {
+		return sandbox.Mount{}, fmt.Errorf("bwrap: destination path is empty")
+	}
+	dst = filepath.Clean(dst)
+	if dst == "/" {
+		return sandbox.Mount{}, fmt.Errorf("bwrap: --%s at / is not supported by runsc", flag)
+	}
+	mnt := sandbox.Mount{
+		Type:        sandbox.MountTypeOverlay,
+		Destination: dst,
+		Lowers:      lowers,
+		Upper:       upper,
+		NoSuid:      true,
+	}
+	c.overlaySrcs = nil
+	return mnt, nil
+}
+
+// checkNoOverlap returns the host directories dirs with all symlinks
+// resolved. It reports an error if two of them are the same directory or one
+// contains the other. The layers of an overlay must not overlap, so that
+// changes to the overlay cannot reach a lower layer.
+func checkNoOverlap(flag string, dirs []string) ([]string, error) {
+	resolved, err := resolveDirs(dirs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range resolved {
+		for j := range i {
+			if contains(resolved[j], resolved[i]) || contains(resolved[i], resolved[j]) {
+				return nil, fmt.Errorf("bwrap: --%s: the overlay directories %s and %s overlap", flag, dirs[j], dirs[i])
+			}
+		}
+	}
+	return resolved, nil
+}
+
+// resolveDirs returns the absolute host paths dirs with all symlinks resolved.
+func resolveDirs(dirs []string) ([]string, error) {
+	resolved := make([]string, len(dirs))
+	for i, d := range dirs {
+		r, err := filepath.EvalSymlinks(d)
+		if err != nil {
+			return nil, fmt.Errorf("bwrap: Can't find source path %v: %v", d, err)
+		}
+		resolved[i] = r
+	}
+	return resolved, nil
+}
+
+// contains reports whether the clean absolute path dir is path or one of its
+// parents.
+func contains(dir, path string) bool {
+	return dir == path || strings.HasPrefix(path, strings.TrimSuffix(dir, "/")+"/")
+}
+
+// hostDir returns the absolute path of dir, which must be a directory on the
+// host. An empty dir is an error, not the current directory.
+func hostDir(dir string) (string, error) {
+	if dir == "" {
+		return "", fmt.Errorf("bwrap: Can't find source path: the path is empty")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("bwrap: Can't get absolute path for source path %v: %v", dir, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("bwrap: Can't find source path %v: %v", abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("bwrap: %v: %v", abs, unix.ENOTDIR)
+	}
+	return abs, nil
 }
 
 // TODO: b/518882196 - Support joining existing user namespaces.

@@ -978,6 +978,132 @@ func TestProductName(t *testing.T) {
 	}
 }
 
+// TestSymlinksAnnotation checks that the symlinks annotation creates its
+// links, and their missing parents, once all mounts are in place, with the
+// permissions of the container's init process.
+func TestSymlinksAnnotation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		links string
+		// mntMode is the mode of the tmpfs at /mnt.
+		mntMode string
+		// nonRoot runs the container as 1000:1000 with caps, by default
+		// none.
+		nonRoot bool
+		caps    []string
+		cwd     string
+		// script runs in the container and must succeed.
+		script  string
+		wantErr string
+	}{
+		{
+			name:    "Created",
+			links:   `[{"target": "../x", "path": "/mnt/a/b/l"}, {"target": "../x", "path": "/mnt/a/b/l"}]`,
+			mntMode: "0755",
+			script:  `test "$(readlink /mnt/a/b/l)" = ../x && test "$(stat -c '%a %u' /mnt/a /mnt/a/b | tr '\n' ' ')" = "700 0 700 0 "`,
+		},
+		{
+			name:    "CreatedByNonRootUser",
+			links:   `[{"target": "x", "path": "/mnt/a/l"}]`,
+			mntMode: "1777",
+			nonRoot: true,
+			script:  `test "$(readlink /mnt/a/l)" = x && test "$(stat -c '%a %u %g' /mnt/a)" = "700 1000 1000"`,
+		},
+		{
+			name:    "NoWritePermission",
+			links:   `[{"target": "x", "path": "/mnt/l"}]`,
+			mntMode: "0755",
+			nonRoot: true,
+			wantErr: "permission denied",
+		},
+		{
+			// Without ambient capabilities, a non-root program loses its
+			// capabilities at execve(2), and so do the links.
+			name:    "CapabilitiesLostAtExec",
+			links:   `[{"target": "x", "path": "/mnt/l"}]`,
+			mntMode: "0755",
+			nonRoot: true,
+			caps:    []string{"CAP_DAC_OVERRIDE"},
+			wantErr: "permission denied",
+		},
+		{
+			name:    "ReadOnlyRoot",
+			links:   `[{"target": "x", "path": "/gvisor-symlink-test"}]`,
+			mntMode: "0755",
+			wantErr: "read-only file system",
+		},
+		{
+			name:    "NotASymlink",
+			links:   `[{"target": "x", "path": "/mnt"}]`,
+			mntMode: "0755",
+			wantErr: "is not a symlink",
+		},
+		{
+			name:    "OtherTarget",
+			links:   `[{"target": "x", "path": "/mnt/l"}, {"target": "y", "path": "/mnt/l"}]`,
+			mntMode: "0755",
+			wantErr: "is already there",
+		},
+		{
+			// The working directory is created before the links, so a link
+			// cannot steer where it is created.
+			name:    "WorkingDirectoryFirst",
+			links:   `[{"target": "/etc", "path": "/mnt/l"}]`,
+			mntMode: "1777",
+			nonRoot: true,
+			cwd:     "/mnt/l/x",
+			wantErr: "is not a symlink",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := tc.script
+			if script == "" {
+				script = "true"
+			}
+			spec := testutil.NewSpecWithArgs("/bin/sh", "-c", script)
+			spec.Mounts = append(spec.Mounts, specs.Mount{Type: "tmpfs", Destination: "/mnt", Options: []string{"mode=" + tc.mntMode}})
+			spec.Annotations = map[string]string{specutils.AnnotationSymlinks: tc.links}
+			if tc.nonRoot {
+				spec.Process.User = specs.User{UID: 1000, GID: 1000}
+				spec.Process.Capabilities = &specs.LinuxCapabilities{
+					Bounding:  tc.caps,
+					Effective: tc.caps,
+					Permitted: tc.caps,
+				}
+			}
+			if tc.cwd != "" {
+				spec.Process.Cwd = tc.cwd
+			}
+			conf := testutil.TestConfig(t)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+				Attached:  true,
+			}
+			ws, err := Run(conf, args)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("running container got error %v, want error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("running container: %v", err)
+			}
+			if !ws.Exited() || ws.ExitStatus() != 0 {
+				t.Fatalf("container failed, waitStatus: %v", ws)
+			}
+		})
+	}
+}
+
 // Test the we can execute the application with different path formats.
 func TestExePath(t *testing.T) {
 	// Create two directories that will be prepended to PATH.

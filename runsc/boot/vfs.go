@@ -292,6 +292,27 @@ func setupContainerVFS(ctx context.Context, info *containerInfo, mntr *container
 			procArgs.WorkingDirectory, err)
 	}
 
+	// Create the links after the mounts, the device files and the working
+	// directory, so that these steps, which use rootCreds, do not follow
+	// them. A pod annotation also reaches the pause container, which does
+	// not need the links.
+	links, err := specutils.Symlinks(info.spec)
+	if err != nil {
+		return err
+	}
+	if len(links) > 0 && specutils.SpecContainerType(info.spec) != specutils.ContainerTypeSandbox {
+		linkCreds, err := symlinkCredentials(procArgs)
+		if err != nil {
+			return err
+		}
+		linkArgs := *procArgs
+		linkArgs.Credentials = linkCreds
+		if err := createSymlinks(linkArgs.NewContext(mntr.l.k), linkCreds, mntr.l.k.VFS(), mnsRoot, links); err != nil {
+			return err
+		}
+		procArgs.StartupTimeline.Reached("symlinks created")
+	}
+
 	// We are executing a file directly. Do not resolve the executable path.
 	if procArgs.File != nil {
 		return nil
@@ -1764,6 +1785,65 @@ func (c *containerMounter) makeMountPoint(
 		}
 		if err := fs.MknodAt(ctx, creds, target, mknodOpts); err != nil {
 			return fmt.Errorf("failed to create file mountpoint %q: %w", dest, err)
+		}
+	}
+	return nil
+}
+
+// symlinkParentMode is the mode of the parent directories that
+// createSymlinks creates.
+const symlinkParentMode = 0700
+
+// symlinkCredentials returns the credentials that createSymlinks uses: those
+// of the container's init process once it runs its program. The effective
+// capabilities are those that remain after execve(2), so that the links
+// need no permission that the program does not have. The container's
+// seccomp filter does not apply to them.
+func symlinkCredentials(procArgs *kernel.CreateProcessArgs) (*auth.Credentials, error) {
+	execCreds, _, err := auth.ComputeCredsForExec(procArgs.Credentials,
+		auth.FilePrivileges{SetUserID: auth.NoID, SetGroupID: auth.NoID}, "", /* filename */
+		procArgs.NoNewPrivs, false /* stopPrivGain */, false /* allowSUID */)
+	if err != nil {
+		return nil, fmt.Errorf("computing credentials for symlinks: %w", err)
+	}
+	creds := procArgs.Credentials.Fork()
+	creds.EffectiveCaps &= execCreds.EffectiveCaps
+	return creds, nil
+}
+
+// createSymlinks creates links in order, with creds. Call it once all mounts
+// are in place and read-only mounts are read-only again. A link that already
+// exists with the same target is left as it is, even in a read-only
+// filesystem. Any other file at a link's path is an error. Missing parent
+// directories are created with mode symlinkParentMode.
+func createSymlinks(ctx context.Context, creds *auth.Credentials, vfsObj *vfs.VirtualFilesystem, root vfs.VirtualDentry, links []specutils.Symlink) error {
+	for _, link := range links {
+		pop := &vfs.PathOperation{
+			Root:  root,
+			Start: root,
+			Path:  fspath.Parse(link.Path),
+		}
+		err := vfsObj.SymlinkAt(ctx, creds, pop, link.Target)
+		if linuxerr.Equals(linuxerr.ENOENT, err) {
+			if err := vfsObj.MkdirAllAt(ctx, path.Dir(link.Path), root, creds, &vfs.MkdirOptions{Mode: symlinkParentMode}, true /* mustBeDir */); err != nil {
+				return fmt.Errorf("creating symlink %q: %w", link.Path, err)
+			}
+			err = vfsObj.SymlinkAt(ctx, creds, pop, link.Target)
+		}
+		if err == nil {
+			continue
+		}
+		// The path may already hold the same link, which is not an error.
+		target, readErr := vfsObj.ReadlinkAt(ctx, creds, pop)
+		switch {
+		case readErr == nil && target == link.Target:
+			continue
+		case readErr == nil:
+			return fmt.Errorf("creating symlink %q: a symlink to %q is already there", link.Path, target)
+		case linuxerr.Equals(linuxerr.EINVAL, readErr):
+			return fmt.Errorf("creating symlink %q: a file that is not a symlink is already there", link.Path)
+		default:
+			return fmt.Errorf("creating symlink %q: %w", link.Path, err)
 		}
 	}
 	return nil

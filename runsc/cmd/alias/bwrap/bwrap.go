@@ -25,12 +25,14 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
@@ -79,6 +81,7 @@ type HostDir struct {
 type bwrapConfig struct {
 	Mounts      []sandbox.Mount
 	HostDirs    []HostDir
+	Symlinks    []sandbox.Symlink
 	CapOps      []*CapOp
 	UnshareNet  bool
 	Args        []string
@@ -119,10 +122,10 @@ func defaultMounts() []sandbox.Mount {
 
 // newMount creates a mount for the sandbox bindings.
 func (c *bwrapConfig) newMount(src, dst string, mountType sandbox.MountType, readOnly bool) (sandbox.Mount, error) {
-	if dst == "" {
-		return sandbox.Mount{}, fmt.Errorf("bwrap: destination path is empty")
+	dst, err := c.mountDest(dst)
+	if err != nil {
+		return sandbox.Mount{}, err
 	}
-	dst = filepath.Clean(dst)
 	if mountType != sandbox.MountTypeBind {
 		return sandbox.Mount{Type: mountType, Destination: dst}, nil
 	}
@@ -143,6 +146,122 @@ func (c *bwrapConfig) newMount(src, dst string, mountType sandbox.MountType, rea
 		m.Recursive, m.Private, m.NoSuid, m.NoDev = true, true, true, true
 	}
 	return m, nil
+}
+
+// mountDest returns the path of a mount at dst: dst made absolute, with the
+// --symlink entries declared so far followed in its parent directories. A
+// mount on a symlink is refused, so dst itself must not be one of them.
+func (c *bwrapConfig) mountDest(dst string) (string, error) {
+	if dst == "" {
+		return "", fmt.Errorf("bwrap: destination path is empty")
+	}
+	dst, err := c.resolvePath(dst, false /* followLast */)
+	if err != nil {
+		return "", err
+	}
+	if _, ok := c.symlinkTarget(dst); ok {
+		return "", fmt.Errorf("bwrap: Can't mount on %s: it is a --%s", dst, flagSymlink)
+	}
+	return dst, nil
+}
+
+// addMounts appends mnts to the mount list, and removes the symlinks that
+// they hide.
+func (c *bwrapConfig) addMounts(mnts ...sandbox.Mount) {
+	for _, m := range mnts {
+		c.hideSymlinks(m.Destination)
+		c.Mounts = append(c.Mounts, m)
+	}
+}
+
+// hideSymlinks removes the --symlink entries declared so far whose path is
+// dst or below dst. A mount at dst hides them.
+func (c *bwrapConfig) hideSymlinks(dst string) {
+	c.Symlinks = slices.DeleteFunc(c.Symlinks, func(l sandbox.Symlink) bool {
+		_, ok := pathBelow(dst, l.Path)
+		return ok
+	})
+}
+
+// resolvePath returns path as an absolute, clean path, with the --symlink
+// entries declared so far followed where path goes through them. The last
+// component is followed only if followLast is true. The components are
+// resolved in order, so a ".." after a symlink goes to the parent of its
+// target. The sandbox creates the symlinks only after all mounts, so the
+// paths of later operations must go through them here.
+func (c *bwrapConfig) resolvePath(path string, followLast bool) (string, error) {
+	resolved := "/"
+	rest := strings.Split(path, "/")
+	hops := 0
+	for len(rest) > 0 {
+		name := rest[0]
+		rest = rest[1:]
+		switch name {
+		case "", ".":
+			continue
+		case "..":
+			resolved = filepath.Dir(resolved)
+			continue
+		}
+		next := filepath.Join(resolved, name)
+		target, ok := c.symlinkTarget(next)
+		if !ok || (!followLast && isLastComponent(rest)) {
+			resolved = next
+			continue
+		}
+		hops++
+		if hops > linux.MaxSymlinkTraversals {
+			return "", fmt.Errorf("bwrap: Can't resolve %s: %w", path, unix.ELOOP)
+		}
+		if filepath.IsAbs(target) {
+			resolved = "/"
+		}
+		rest = append(strings.Split(target, "/"), rest...)
+	}
+	return resolved, nil
+}
+
+// isLastComponent reports whether rest, the path components after the
+// current one, holds no other component.
+func isLastComponent(rest []string) bool {
+	for _, name := range rest {
+		if name != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// symlinkTarget returns the target of the first --symlink declared so far
+// whose path is path.
+func (c *bwrapConfig) symlinkTarget(path string) (string, bool) {
+	for _, l := range c.Symlinks {
+		if l.Path == path {
+			return l.Target, true
+		}
+	}
+	return "", false
+}
+
+// hasSymlinkAtOrBelow reports whether a --symlink declared so far has its path
+// at or below path.
+func (c *bwrapConfig) hasSymlinkAtOrBelow(path string) bool {
+	for _, l := range c.Symlinks {
+		if _, ok := pathBelow(path, l.Path); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// pathBelow reports whether path is parent or below parent, and returns path
+// relative to parent.
+func pathBelow(parent, path string) (string, bool) {
+	rel, err := filepath.Rel(parent, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", false
+	}
+	return rel, true
 }
 
 // getRootMount returns the root mount if it exists.
@@ -301,6 +420,11 @@ func (c *bwrapConfig) prepareSandbox() ([]sandbox.Option, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to map current working directory: %v", err)
 	}
+	// The sandbox creates the working directory before the symlinks, so it
+	// must not go through one of them.
+	if cwd, err = c.resolvePath(cwd, true /* followLast */); err != nil {
+		return nil, err
+	}
 
 	network := sandbox.NetworkModeHost
 	if c.UnshareNet {
@@ -337,6 +461,9 @@ func (c *bwrapConfig) prepareSandbox() ([]sandbox.Option, error) {
 	mounts = append(mounts, defaultMounts()...)
 	mounts = append(mounts, c.Mounts...)
 	opts = append(opts, sandbox.WithMount(mounts...))
+	if len(c.Symlinks) > 0 {
+		opts = append(opts, sandbox.WithSymlinks(c.Symlinks...))
+	}
 
 	var namespaces []specs.LinuxNamespace
 	// Leave ownership unchanged without a user namespace. Otherwise the mapped

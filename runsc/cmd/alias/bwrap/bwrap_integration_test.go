@@ -1196,3 +1196,380 @@ func TestDev(t *testing.T) {
 		})
 	}
 }
+
+func TestSymlink(t *testing.T) {
+	if err := testutil.ConfigureExePath(); err != nil {
+		t.Fatalf("failed to configure exe path: %v", err)
+	}
+
+	stop := testutil.StartReaper()
+	defer stop()
+
+	// hostUID and hostGID own what the sandbox creates in a host bind: the
+	// user that --unshare-user maps the sandbox user to.
+	hostUID, hostGID := os.Getuid(), os.Getgid()
+	if id, err := getEnvID("SUDO_UID", uint32(hostUID)); err == nil {
+		hostUID = int(id)
+	}
+	if id, err := getEnvID("SUDO_GID", uint32(hostGID)); err == nil {
+		hostGID = int(id)
+	}
+
+	// tmpfsRoot gives a tmpfs root with the host's programs, and makes the
+	// usual root symlinks to them.
+	tmpfsRoot := []string{
+		"--ro-bind", "/usr", "/usr",
+		"--symlink", "usr/bin", "/bin",
+		"--symlink", "usr/lib", "/lib",
+		"--symlink", "usr/lib64", "/lib64",
+	}
+
+	// hostDir is bind mounted at /mnt in the cases that need a host
+	// directory. Each case gets a fresh one.
+	const hostDir = "HOST_DIR"
+	tests := []struct {
+		name string
+		// setup prepares hostDir before the run.
+		setup func(t *testing.T, hostDir string)
+		// bwrapArgs are the arguments, with hostDir standing in for the host
+		// directory.
+		bwrapArgs  []string
+		wantOutput string
+		// wantErr, if set, is text the failed run's stderr must contain.
+		wantErr string
+		// wantHostLink, if set, is a path under hostDir that must be a
+		// symlink to wantHostTarget afterwards, in a directory with mode
+		// 0700 that hostUID:hostGID owns.
+		wantHostLink   string
+		wantHostTarget string
+	}{
+		{
+			// This case runs as root without --unshare-user: under sudo,
+			// --unshare-user with UID 0 maps no host root for the gofer, which
+			// then cannot reach the bundle that backs a tmpfs root.
+			name: "TmpfsRoot",
+			bwrapArgs: slices.Concat(tmpfsRoot, []string{
+				"--symlink", "/run", "/var/run",
+				"--",
+				"/bin/sh", "-c", `echo $(readlink /var/run) $(stat -c "%a %u %g" /var)`,
+			}),
+			wantOutput: "/run 700 0 0",
+		},
+		{
+			// The new parents belong to the sandbox user, so it can use them.
+			name: "TmpfsRootNonRootUser",
+			bwrapArgs: slices.Concat([]string{"--unshare-user", "--uid", "1000", "--gid", "1000"}, tmpfsRoot, []string{
+				"--symlink", "x", "/a/b/l",
+				"--",
+				"/bin/sh", "-c", `ls /a/b >/dev/null && echo $(readlink /a/b/l) $(stat -c "%a %u %g" /a /a/b /a/b/l)`,
+			}),
+			wantOutput: "x 700 1000 1000 700 1000 1000 777 1000 1000",
+		},
+		{
+			name: "InTmpfs",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--symlink", "../x", "/mnt/a/l",
+				"--",
+				"/bin/sh", "-c", "readlink /mnt/a/l",
+			},
+			wantOutput: "../x",
+		},
+		{
+			name: "InWritableBind",
+			setup: func(t *testing.T, hostDir string) {
+				// Let the sandbox user that SUDO_UID maps to write here.
+				if err := os.Chmod(hostDir, 0777); err != nil {
+					t.Fatal(err)
+				}
+			},
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--bind", hostDir, "/mnt",
+				"--symlink", "/target", "/mnt/new/l",
+				"--",
+				"/bin/sh", "-c", "readlink /mnt/new/l",
+			},
+			wantOutput:     "/target",
+			wantHostLink:   "new/l",
+			wantHostTarget: "/target",
+		},
+		{
+			name: "InReadOnlyBind",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--ro-bind", hostDir, "/mnt",
+				"--symlink", "x", "/mnt/l",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "read-only file system",
+		},
+		{
+			name: "SameInReadOnlyBind",
+			setup: func(t *testing.T, hostDir string) {
+				if err := os.Symlink("x", filepath.Join(hostDir, "l")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--ro-bind", hostDir, "/mnt",
+				"--symlink", "x", "/mnt/l",
+				"--",
+				"/bin/sh", "-c", "readlink /mnt/l",
+			},
+			wantOutput: "x",
+		},
+		{
+			name: "OtherInReadOnlyBind",
+			setup: func(t *testing.T, hostDir string) {
+				if err := os.Symlink("y", filepath.Join(hostDir, "l")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--ro-bind", hostDir, "/mnt",
+				"--symlink", "x", "/mnt/l",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "is already there",
+		},
+		{
+			name: "InReadOnlyRoot",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--symlink", "x", "/gvisor-symlink-test",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "read-only file system",
+		},
+		{
+			name: "Repeated",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--symlink", "x", "/mnt/l",
+				"--symlink", "x", "/mnt/l",
+				"--",
+				"/bin/sh", "-c", "readlink /mnt/l",
+			},
+			wantOutput: "x",
+		},
+		{
+			name: "RepeatedWithOtherTarget",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--symlink", "x", "/mnt/l",
+				"--symlink", "y", "/mnt/l",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "an earlier --symlink points it to x",
+		},
+		{
+			name: "NotASymlink",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--symlink", "x", "/usr/bin",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "is not a symlink",
+		},
+		{
+			name: "HiddenByLaterMount",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--symlink", "x", "/mnt/l",
+				"--tmpfs", "/mnt",
+				"--",
+				"/bin/sh", "-c", "test ! -L /mnt/l && echo ok",
+			},
+			wantOutput: "ok",
+		},
+		{
+			name: "MountInSymlink",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--dir", "/mnt/real",
+				"--symlink", "real", "/mnt/link",
+				"--tmpfs", "/mnt/link/sub",
+				"--",
+				"/bin/sh", "-c", "test -d /mnt/real/sub && readlink /mnt/link",
+			},
+			wantOutput: "real",
+		},
+		{
+			name: "MountOnSymlink",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--symlink", "x", "/mnt/l",
+				"--tmpfs", "/mnt/l",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "Can't mount on /mnt/l",
+		},
+		{
+			// The link is created with the permissions of the command, so
+			// without CAP_DAC_OVERRIDE a mode 0555 directory refuses it.
+			name: "NoCapsInReadOnlyDir",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--cap-drop", "ALL",
+				"--ro-bind", "/", "/",
+				"--perms", "0555", "--tmpfs", "/mnt",
+				"--symlink", "x", "/mnt/l",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "permission denied",
+		},
+		{
+			name: "CapsInReadOnlyDir",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--perms", "0555", "--tmpfs", "/mnt",
+				"--symlink", "x", "/mnt/l",
+				"--",
+				"/bin/sh", "-c", "readlink /mnt/l",
+			},
+			wantOutput: "x",
+		},
+		{
+			name: "ParentIsFile",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--symlink", "x", "/etc/passwd/l",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "not a directory",
+		},
+		{
+			// The first link makes /mnt/a a directory, so the second one
+			// finds a file that is not a symlink at /mnt/a.
+			name: "LinkAboveEarlierLink",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--symlink", "x", "/mnt/a/b",
+				"--symlink", "y", "/mnt/a",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "is not a symlink",
+		},
+		{
+			name: "ChdirThroughSymlink",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--tmpfs", "/mnt",
+				"--symlink", "/usr", "/mnt/u",
+				"--chdir", "/mnt/u/bin",
+				"--",
+				"/bin/sh", "-c", "pwd -P && readlink /mnt/u",
+			},
+			wantOutput: "/usr/bin\n/usr",
+		},
+		{
+			name: "EmptyTarget",
+			bwrapArgs: []string{
+				"--unshare-user",
+				"--ro-bind", "/", "/",
+				"--symlink", "", "/mnt/l",
+				"--",
+				"/bin/sh", "-c", "echo unreachable",
+			},
+			wantErr: "TARGET is empty",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runRootDir := newRunRootDir(t)
+			// Under sudo, the sandbox user that SUDO_UID maps to must be able
+			// to enter the directory, whatever the umask of the test.
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.setup != nil {
+				tc.setup(t, dir)
+			}
+
+			args := []string{"--root", runRootDir, "bwrap"}
+			for _, arg := range tc.bwrapArgs {
+				if arg == hostDir {
+					arg = dir
+				}
+				args = append(args, arg)
+			}
+			cmd := exec.Command(specutils.ExePath, args...)
+
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			err := testutil.RunCmd(cmd)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("runsc bwrap succeeded, want failure with %q\nStdout: %s", tc.wantErr, stdout.String())
+				}
+				if !strings.Contains(stderr.String(), tc.wantErr) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("runsc bwrap failed: %v\nStderr: %s", err, stderr.String())
+			}
+
+			if got := strings.TrimSpace(stdout.String()); got != tc.wantOutput {
+				t.Errorf("output = %q, want %q", got, tc.wantOutput)
+			}
+
+			if tc.wantHostLink == "" {
+				return
+			}
+			link := filepath.Join(dir, tc.wantHostLink)
+			if target, err := os.Readlink(link); err != nil || target != tc.wantHostTarget {
+				t.Errorf("os.Readlink(%q) = %q, %v, want %q", link, target, err, tc.wantHostTarget)
+			}
+			for _, p := range []string{link, filepath.Dir(link)} {
+				var st unix.Stat_t
+				if err := unix.Lstat(p, &st); err != nil {
+					t.Errorf("unix.Lstat(%q) failed: %v", p, err)
+					continue
+				}
+				if int(st.Uid) != hostUID || int(st.Gid) != hostGID {
+					t.Errorf("%q is owned by %d:%d, want %d:%d", p, st.Uid, st.Gid, hostUID, hostGID)
+				}
+			}
+			if info, err := os.Stat(filepath.Dir(link)); err != nil || info.Mode().Perm() != 0700 {
+				t.Errorf("os.Stat(%q) = %v, %v, want a directory with mode 0700", filepath.Dir(link), info, err)
+			}
+		})
+	}
+}

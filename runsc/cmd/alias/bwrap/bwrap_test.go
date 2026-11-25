@@ -27,6 +27,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/sandboxexec/sandbox"
 )
 
@@ -82,10 +83,11 @@ func TestSandboxOptions(t *testing.T) {
 		t.Fatalf("Failed to get current working directory: %v", err)
 	}
 	tests := []struct {
-		name        string
-		cfg         *bwrapConfig
-		wantSpec    specs.Spec
-		errContains string
+		name         string
+		cfg          *bwrapConfig
+		wantSpec     specs.Spec
+		wantSymlinks []specutils.Symlink
+		errContains  string
 	}{
 		{
 			name: "WithRootMount",
@@ -175,6 +177,61 @@ func TestSandboxOptions(t *testing.T) {
 			},
 			errContains: "--uid requires --unshare-user",
 		},
+		{
+			// The working directory goes through the symlinks.
+			name: "ChdirThroughSymlink",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeBind, Source: "/", Destination: "/", ReadOnly: true},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"},
+				},
+				Symlinks: []sandbox.Symlink{{Target: "real", Path: "/mnt/link"}},
+				Chdir:    "/mnt/link/sub",
+				Args:     []string{"ls"},
+			},
+			wantSymlinks: []specutils.Symlink{{Target: "real", Path: "/mnt/link"}},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "/", Readonly: true},
+				Process: &specs.Process{Cwd: "/mnt/real/sub"},
+				Mounts: appendMounts(
+					defaultMounts,
+					[]specs.Mount{
+						{Type: "bind", Source: "/", Destination: "/", Options: []string{"ro"}},
+						{Type: "tmpfs", Destination: "/mnt"},
+					},
+				),
+				Linux: &specs.Linux{},
+			},
+		},
+		{
+			name: "Symlinks",
+			cfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Symlinks: []sandbox.Symlink{
+					{Target: "/run", Path: "/var/run"},
+					{Target: "usr/bin", Path: "/bin"},
+				},
+				Args: []string{"ls"},
+			},
+			wantSymlinks: []specutils.Symlink{
+				{Target: "/run", Path: "/var/run"},
+				{Target: "usr/bin", Path: "/bin"},
+			},
+			wantSpec: specs.Spec{
+				Root:    &specs.Root{Path: "rootfs"},
+				Process: &specs.Process{Cwd: "/"},
+				Mounts: appendMounts(
+					[]specs.Mount{{Type: "tmpfs", Destination: "/"}},
+					defaultMounts,
+				),
+				Linux: &specs.Linux{},
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -205,9 +262,17 @@ func TestSandboxOptions(t *testing.T) {
 				t.Errorf("Environment mismatch (-got +want):\n%s", diff)
 			}
 
+			links, err := specutils.Symlinks(got)
+			if err != nil {
+				t.Fatalf("specutils.Symlinks failed: %v", err)
+			}
+			if diff := cmp.Diff(links, tc.wantSymlinks); diff != "" {
+				t.Errorf("Symlinks mismatch (-got +want):\n%s", diff)
+			}
+
 			diff := cmp.Diff(got, &tc.wantSpec,
 				cmpopts.IgnoreFields(specs.Process{}, "Capabilities", "Env", "Args"),
-				cmpopts.IgnoreFields(specs.Spec{}, "Version"),
+				cmpopts.IgnoreFields(specs.Spec{}, "Version", "Annotations"),
 				cmpopts.SortSlices(func(a, b specs.LinuxNamespace) bool {
 					if a.Type != b.Type {
 						return a.Type < b.Type
@@ -429,6 +494,22 @@ func TestSubDirPath(t *testing.T) {
 func TestParseFlags(t *testing.T) {
 	// mntSrc is a host directory for --bind and --ro-bind sources.
 	mntSrc := t.TempDir()
+	// symlinkChain returns the arguments for n symlinks /s0 -> /s1 -> ... ->
+	// /sn, followed by a tmpfs at /s0/x.
+	symlinkChain := func(n int) []string {
+		var args []string
+		for i := 1; i <= n; i++ {
+			args = append(args, "--symlink", "/s"+strconv.Itoa(i), "/s"+strconv.Itoa(i-1))
+		}
+		return append(args, "--tmpfs", "/s0/x", "bash")
+	}
+	chainLinks := func(n int) []sandbox.Symlink {
+		var links []sandbox.Symlink
+		for i := 1; i <= n; i++ {
+			links = append(links, sandbox.Symlink{Target: "/s" + strconv.Itoa(i), Path: "/s" + strconv.Itoa(i-1)})
+		}
+		return links
+	}
 	// rootBind is the mount --ro-bind / / produces.
 	rootBind := sandbox.Mount{Type: sandbox.MountTypeBind, Source: "/", Destination: "/", ReadOnly: true, Recursive: true, Private: true, NoSuid: true, NoDev: true}
 
@@ -920,6 +1001,375 @@ func TestParseFlags(t *testing.T) {
 			args:        []string{"--perms", "0700", "--ro-bind", "/", "/", "--", "bash"},
 			errContains: "--perms must be followed by",
 		},
+		{
+			name: "Symlink",
+			args: []string{"--symlink", "/run", "/var/run", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Symlinks: []sandbox.Symlink{{Target: "/run", Path: "/var/run"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// TARGET is kept as it is. DEST is made absolute and clean.
+			name: "SymlinkRelative",
+			args: []string{"--symlink", "../x/", "rel//l/", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Symlinks: []sandbox.Symlink{{Target: "../x/", Path: "/rel/l"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// The sandbox checks that the same TARGET is already there.
+			name: "SymlinkRepeated",
+			args: []string{"--symlink", "x", "/l", "--symlink", "x", "/l", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Symlinks: []sandbox.Symlink{{Target: "x", Path: "/l"}, {Target: "x", Path: "/l"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			name: "SymlinkInSymlink",
+			args: []string{"--symlink", "usr/lib", "/lib", "--symlink", "x", "/lib/l", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Symlinks: []sandbox.Symlink{
+					{Target: "usr/lib", Path: "/lib"},
+					{Target: "x", Path: "/usr/lib/l"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name: "SymlinkHiddenByMount",
+			args: []string{"--tmpfs", "/t", "--symlink", "x", "/t/l", "--tmpfs", "/t", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/t"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/t"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name: "SymlinkHiddenByRootBind",
+			args: []string{"--symlink", "x", "/l", "--ro-bind", "/", "/", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{rootBind},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			// A mount next to the symlink leaves it visible.
+			name: "SymlinkNextToMount",
+			args: []string{"--symlink", "x", "/a/l", "--tmpfs", "/a/b", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/a/b"}},
+				Symlinks: []sandbox.Symlink{{Target: "x", Path: "/a/l"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			name: "MountInSymlink",
+			args: []string{"--symlink", "/run", "/var/run", "--tmpfs", "/var/run/x", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/run/x"}},
+				Symlinks: []sandbox.Symlink{{Target: "/run", Path: "/var/run"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// A relative TARGET is relative to the directory that holds DEST.
+			name: "BindInRelativeSymlink",
+			args: []string{"--symlink", "../data", "/mnt/link", "--bind", mntSrc, "/mnt/link/sub", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/data/sub"}},
+				Symlinks: []sandbox.Symlink{{Target: "../data", Path: "/mnt/link"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			name:        "MountOnSymlink",
+			args:        []string{"--symlink", "x", "/l", "--tmpfs", "/l", "bash"},
+			errContains: "Can't mount on /l",
+		},
+		{
+			name:        "ProcOnSymlink",
+			args:        []string{"--symlink", "x", "/l", "--proc", "/l", "bash"},
+			errContains: "Can't mount on /l",
+		},
+		{
+			// The sandbox creates the parents of the symlink, so --dir finds
+			// DEST and does not hide the symlink behind a tmpfs.
+			name: "DirAboveSymlink",
+			args: []string{"--symlink", "x", "/d/l", "--dir", "/d", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Symlinks: []sandbox.Symlink{{Target: "x", Path: "/d/l"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			name: "DirInSymlink",
+			args: []string{"--tmpfs", "/mnt", "--symlink", "real", "/mnt/link", "--dir", "/mnt/link/d", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/real/d"},
+				},
+				Symlinks: []sandbox.Symlink{{Target: "real", Path: "/mnt/link"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			name:        "SymlinkLoop",
+			args:        []string{"--symlink", "/b", "/a", "--symlink", "/a", "/b", "--tmpfs", "/a/x", "bash"},
+			errContains: "Can't resolve /a/x: too many levels of symbolic links",
+		},
+		{
+			name:        "SymlinkEmptyTarget",
+			args:        []string{"--symlink", "", "/l", "bash"},
+			errContains: "--symlink TARGET is empty",
+		},
+		{
+			name:        "SymlinkEmptyDest",
+			args:        []string{"--symlink", "x", "", "bash"},
+			errContains: "destination path is empty",
+		},
+		{
+			name:        "SymlinkAtRoot",
+			args:        []string{"--symlink", "x", "/", "bash"},
+			errContains: "Can't create symlink at /",
+		},
+		{
+			name:        "MissingSymlinkArgs",
+			args:        []string{"--symlink", "x"},
+			errContains: "--symlink takes 2 arguments",
+		},
+		{
+			name:        "DirOnSymlink",
+			args:        []string{"--tmpfs", "/mnt", "--symlink", "real", "/mnt/link", "--dir", "/mnt/link", "bash"},
+			errContains: "Can't mkdir /mnt/link: it is a --symlink",
+		},
+		{
+			// The skipped --dir still takes the pending --perms.
+			name: "PermsWithDirAboveSymlink",
+			args: []string{"--symlink", "x", "/d/l", "--perms", "0755", "--dir", "/d", "--tmpfs", "/t", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/t"}},
+				Symlinks: []sandbox.Symlink{{Target: "x", Path: "/d/l"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			name:        "RelativeMountOnSymlink",
+			args:        []string{"--tmpfs", "/mnt", "--symlink", "x", "/mnt/l", "--tmpfs", "mnt/l", "bash"},
+			errContains: "Can't mount on /mnt/l",
+		},
+		{
+			name: "RelativeMountAboveSymlink",
+			args: []string{"--symlink", "x", "/mnt/a/l", "--tmpfs", "mnt/a", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/a"}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			name: "RelativeMountInSymlink",
+			args: []string{"--symlink", "real", "/mnt/link", "--tmpfs", "mnt/link/sub", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/real/sub"}},
+				Symlinks: []sandbox.Symlink{{Target: "real", Path: "/mnt/link"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// ".." after a symlink goes to the parent of its target.
+			name: "DotDotAfterSymlink",
+			args: []string{"--tmpfs", "/mnt", "--symlink", "/mnt/a/b", "/mnt/link", "--tmpfs", "/mnt/link/../foo", "--symlink", "t", "/mnt/link/../l2", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/a/foo"},
+				},
+				Symlinks: []sandbox.Symlink{
+					{Target: "/mnt/a/b", Path: "/mnt/link"},
+					{Target: "t", Path: "/mnt/a/l2"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			// Each relative target is relative to the directory that holds
+			// its symlink.
+			name: "RelativeSymlinkChain",
+			args: []string{"--symlink", "usr/lib", "/lib", "--symlink", "../lib64", "/usr/lib", "--tmpfs", "/lib/x", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/lib64/x"}},
+				Symlinks: []sandbox.Symlink{
+					{Target: "usr/lib", Path: "/lib"},
+					{Target: "../lib64", Path: "/usr/lib"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name: "SymlinkChainAtLimit",
+			args: symlinkChain(40),
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/s40/x"}},
+				Symlinks: chainLinks(40),
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			name:        "SymlinkChainOverLimit",
+			args:        symlinkChain(41),
+			errContains: "too many levels of symbolic links",
+		},
+		{
+			// The dev mount hides the symlink before DEST/pts is resolved.
+			name: "DevAboveSymlink",
+			args: []string{"--symlink", "x", "/mnt/pts", "--dev", "/mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeDevtmpfs, Destination: "/mnt"},
+					{Type: sandbox.MountTypeDevpts, Destination: "/mnt/pts"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			// --dev /dev reuses the default /dev, which still hides the link.
+			name: "DefaultDevHidesSymlink",
+			args: []string{"--symlink", "x", "/dev/l", "--dev", "/dev", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:  os.Environ(),
+				UID:  -1,
+				GID:  -1,
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name: "RepeatedProcHidesSymlink",
+			args: []string{"--proc", "/p", "--symlink", "x", "/p/l", "--proc", "/p", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeProc, Destination: "/p"}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			name:        "SymlinkOtherTarget",
+			args:        []string{"--symlink", "x", "/l", "--symlink", "y", "/l", "bash"},
+			errContains: "Can't create symlink at /l to y: an earlier --symlink points it to x",
+		},
+		{
+			// The conflict is an error even if a later mount would hide both
+			// symlinks.
+			name:        "SymlinkOtherTargetThenHidden",
+			args:        []string{"--tmpfs", "/t", "--symlink", "x", "/t/l", "--symlink", "y", "/t/l", "--tmpfs", "/t", "bash"},
+			errContains: "an earlier --symlink points it to x",
+		},
+		{
+			// The conflict is found through the earlier symlinks.
+			name:        "SymlinkOtherTargetThroughSymlink",
+			args:        []string{"--symlink", "real", "/d", "--symlink", "x", "/real/l", "--symlink", "y", "/d/l", "bash"},
+			errContains: "Can't create symlink at /real/l to y",
+		},
+		{
+			name:        "SymlinkAtDot",
+			args:        []string{"--tmpfs", "/mnt", "--symlink", "x", "/mnt/new/.", "bash"},
+			errContains: "Can't create symlink at /mnt/new/.: it is not a new file",
+		},
+		{
+			// Under a bind, --dir creates the resolved path on the host.
+			name: "HostDirInSymlink",
+			args: []string{"--bind", mntSrc, "/mnt", "--symlink", "sub", "/mnt/link", "--dir", "/mnt/link/d", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:      os.Environ(),
+				UID:      -1,
+				GID:      -1,
+				Mounts:   []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntSrc, Destination: "/mnt"}},
+				HostDirs: []HostDir{{Dest: "/mnt/sub/d", Path: filepath.Join(mntSrc, "sub/d"), Perms: defaultDirPerms}},
+				Symlinks: []sandbox.Symlink{{Target: "sub", Path: "/mnt/link"}},
+				Args:     []string{"bash"},
+			},
+		},
+		{
+			// A hidden symlink no longer redirects later paths.
+			name: "HiddenSymlinkDoesNotRedirect",
+			args: []string{"--tmpfs", "/mnt", "--symlink", "real", "/mnt/link", "--tmpfs", "/mnt", "--tmpfs", "/mnt/link/sub", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt/link/sub"},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name:        "PermsBeforeSymlink",
+			args:        []string{"--perms", "0700", "--symlink", "x", "/l", "bash"},
+			errContains: "--perms must be followed by",
+		},
 	}
 
 	for _, tc := range tests {
@@ -939,7 +1389,7 @@ func TestParseFlags(t *testing.T) {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 
-			if diff := cmp.Diff(cfg, tc.wantCfg, cmpopts.IgnoreUnexported(bwrapConfig{})); diff != "" {
+			if diff := cmp.Diff(cfg, tc.wantCfg, cmpopts.IgnoreUnexported(bwrapConfig{}), cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("bwrapConfig mismatch (-got +want):\n%s", diff)
 			}
 		})

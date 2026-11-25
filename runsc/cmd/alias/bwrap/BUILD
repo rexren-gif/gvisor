@@ -15,6 +15,7 @@ go_library(
         "//:__subpackages__",
     ],
     deps = [
+        "//pkg/abi/linux",
         "//pkg/log",
         "//runsc/cmd/util",
         "//runsc/config",
@@ -33,6 +34,7 @@ go_test(
     embed = [":bwrap"],
     deps = [
         "//runsc/config",
+        "//runsc/specutils",
         "//sandboxexec/sandbox",
         "@com_github_google_go_cmp//cmp:go_default_library",
         "@com_github_google_go_cmp//cmp/cmpopts:go_default_library",

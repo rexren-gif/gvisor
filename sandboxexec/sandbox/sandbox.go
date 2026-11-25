@@ -805,6 +805,32 @@ func (s *Sandbox) Close(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// PID returns the host PID of the sandbox process, as `runsc state` reports it.
+// That process runs gVisor's kernel outside the sandbox: joining its
+// namespaces or tracing it runs code outside the sandbox. Limits and cgroup
+// moves applied to it do not cover the workload, whose threads run in other
+// host processes. The PID is stale once the sandbox stops.
+func (s *Sandbox) PID(ctx context.Context) (int, error) {
+	out, err := exec.CommandContext(ctx, s.runscPath, "--root", s.rootState, "state", s.id).Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+			return 0, fmt.Errorf("failed to get sandbox state: %w: %s", err, bytes.TrimSpace(exitErr.Stderr))
+		}
+		return 0, fmt.Errorf("failed to get sandbox state: %w", err)
+	}
+	var state struct {
+		Pid int `json:"pid"`
+	}
+	if err := json.Unmarshal(out, &state); err != nil {
+		return 0, fmt.Errorf("failed to parse sandbox state %q: %w", out, err)
+	}
+	if state.Pid <= 0 {
+		return 0, fmt.Errorf("sandbox state has no PID: %q", out)
+	}
+	return state.Pid, nil
+}
+
 // Bundle returns the path to the OCI bundle directory for this sandbox.
 func (s *Sandbox) Bundle() string {
 	return s.bundleDir

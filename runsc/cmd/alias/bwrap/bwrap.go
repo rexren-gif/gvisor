@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -34,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/sandboxexec/sandbox"
 )
@@ -75,10 +77,27 @@ type HostDir struct {
 	Perms uint32
 }
 
+// defaultFilePerms is the mode of a --file without --perms.
+const defaultFilePerms = 0666
+
+// File is a --file entry.
+type File struct {
+	// FD is the descriptor that holds the data.
+	FD int
+	// Dest is the sandbox path, absolute and clean.
+	Dest string
+	// Perms is the mode of a new file, from --perms or defaultFilePerms.
+	Perms uint32
+	// Hidden reports whether a later mount hides Dest. The sandbox does not
+	// create a hidden file, but runsc still reads its descriptor.
+	Hidden bool
+}
+
 // bwrapConfig represents the configuration for the bwrap sandbox.
 type bwrapConfig struct {
 	Mounts      []sandbox.Mount
 	HostDirs    []HostDir
+	Files       []File
 	CapOps      []*CapOp
 	UnshareNet  bool
 	Args        []string
@@ -143,6 +162,78 @@ func (c *bwrapConfig) newMount(src, dst string, mountType sandbox.MountType, rea
 		m.Recursive, m.Private, m.NoSuid, m.NoDev = true, true, true, true
 	}
 	return m, nil
+}
+
+// addMounts applies each mount in mnts to the --file entries declared so far
+// (see coverFiles), and appends it to the mount list.
+func (c *bwrapConfig) addMounts(mnts ...sandbox.Mount) error {
+	for _, m := range mnts {
+		if err := c.coverFiles(m); err != nil {
+			return err
+		}
+		c.Mounts = append(c.Mounts, m)
+	}
+	return nil
+}
+
+// coverFiles applies a mount m to the --file entries declared so far. A
+// regular file is not a directory, so m fails below a file, and also at a
+// file, unless m binds a host file that is not a directory. m hides the files
+// at or below its destination.
+func (c *bwrapConfig) coverFiles(m sandbox.Mount) error {
+	dst := filepath.Join("/", m.Destination)
+	if f, ok := c.fileAtOrAbove(dst); ok && (f.Dest != dst || !isFileBind(m)) {
+		return fmt.Errorf("bwrap: Can't mount on %s: --%s %s is not a directory", dst, flagFile, f.Dest)
+	}
+	for i := range c.Files {
+		if _, ok := pathBelow(dst, c.Files[i].Dest); ok {
+			c.Files[i].Hidden = true
+		}
+	}
+	return nil
+}
+
+// isFileBind reports whether m binds a host file that is not a directory.
+func isFileBind(m sandbox.Mount) bool {
+	if m.Type != sandbox.MountTypeBind {
+		return false
+	}
+	info, err := os.Stat(m.Source)
+	return err == nil && !info.IsDir()
+}
+
+// fileAtOrAbove returns the visible --file entry declared so far whose path
+// is path or a parent of path. A relative path starts at "/".
+func (c *bwrapConfig) fileAtOrAbove(path string) (File, bool) {
+	path = filepath.Join("/", path)
+	for _, f := range c.Files {
+		if _, ok := pathBelow(f.Dest, path); ok && !f.Hidden {
+			return f, true
+		}
+	}
+	return File{}, false
+}
+
+// hasFileBelow reports whether a visible --file entry declared so far has its
+// path below path. A relative path starts at "/".
+func (c *bwrapConfig) hasFileBelow(path string) bool {
+	path = filepath.Join("/", path)
+	for _, f := range c.Files {
+		if rel, ok := pathBelow(path, f.Dest); ok && rel != "." && !f.Hidden {
+			return true
+		}
+	}
+	return false
+}
+
+// pathBelow reports whether path is parent or below parent, and returns path
+// relative to parent.
+func pathBelow(parent, path string) (string, bool) {
+	rel, err := filepath.Rel(parent, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", false
+	}
+	return rel, true
 }
 
 // getRootMount returns the root mount if it exists.
@@ -456,18 +547,140 @@ func mkdir(path string, perms uint32, uid, gid int) error {
 	return unix.Chmod(path, perms|st.Mode&unix.S_ISGID)
 }
 
+// readFiles reads the data of each --file in command-line order, from the
+// current offset of its descriptor to the end, into a new memfd, and then
+// closes the descriptor (see consumeFD). A descriptor is consumed once, so a
+// second --file with the same descriptor fails with EBADF. It returns the
+// files that the sandbox must create, which leave out the hidden entries, and
+// a function that closes their memfds.
+func (c *bwrapConfig) readFiles() ([]sandbox.File, func(), error) {
+	var files []sandbox.File
+	closeFiles := func() {
+		for _, f := range files {
+			f.Data.Close()
+		}
+	}
+	fail := func(err error) ([]sandbox.File, func(), error) {
+		closeFiles()
+		return nil, nil, err
+	}
+	// Check every descriptor before the first memfd can take the number of
+	// one that is not open. A descriptor that runsc inherited has no
+	// FD_CLOEXEC flag, because it went through execve(2). runsc opens its
+	// own descriptors with FD_CLOEXEC, so they do not count as open here.
+	for _, f := range c.Files {
+		if name := runscFD(f.FD); name != "" {
+			return fail(fmt.Errorf("bwrap: Can't read data for file %s: runsc uses fd %d for --%s", f.Dest, f.FD, name))
+		}
+		flags, err := unix.FcntlInt(uintptr(f.FD), unix.F_GETFD, 0)
+		if err == nil && flags&unix.FD_CLOEXEC != 0 {
+			err = unix.EBADF
+		}
+		if err != nil {
+			return fail(fmt.Errorf("bwrap: Can't read data for file %s: %v", f.Dest, err))
+		}
+	}
+	consumed := make(map[int]bool)
+	for _, f := range c.Files {
+		if consumed[f.FD] {
+			return fail(fmt.Errorf("bwrap: Can't read data for file %s: %v", f.Dest, unix.EBADF))
+		}
+		consumed[f.FD] = true
+		data, err := consumeFD(f.FD)
+		if err != nil {
+			return fail(fmt.Errorf("bwrap: Can't read data for file %s: %v", f.Dest, err))
+		}
+		if f.Hidden {
+			data.Close()
+			continue
+		}
+		files = append(files, sandbox.File{Path: f.Dest, Mode: f.Perms, Data: data})
+	}
+	return files, closeFiles, nil
+}
+
+// runscFDFlags are the global runsc flags that give runsc a descriptor of its
+// own.
+var runscFDFlags = []string{"log-fd", "debug-log-fd", "panic-log-fd", "coverage-fd"}
+
+// runscFD returns the global runsc flag that gives runsc fd, or "".
+func runscFD(fd int) string {
+	for _, name := range runscFDFlags {
+		if f := flag.Lookup(name); f != nil && f.Value.String() == strconv.Itoa(fd) {
+			return name
+		}
+	}
+	return ""
+}
+
+// consumeFD copies the data of descriptor fd, from its current offset to its
+// end, into a new memfd, and then closes fd. Descriptors 0 to 2 get
+// /dev/null instead, so that the standard streams of runsc stay valid.
+func consumeFD(fd int) (*os.File, error) {
+	dup, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	src := os.NewFile(uintptr(dup), "")
+	defer src.Close()
+	memfd, err := unix.MemfdCreate("runsc-bwrap-file", unix.MFD_CLOEXEC)
+	if err != nil {
+		return nil, err
+	}
+	data := os.NewFile(uintptr(memfd), "")
+	if _, err := io.Copy(data, src); err != nil {
+		data.Close()
+		var errno unix.Errno
+		if errors.As(err, &errno) {
+			return nil, errno
+		}
+		return nil, err
+	}
+	if err := closeFD(fd); err != nil {
+		data.Close()
+		return nil, err
+	}
+	return data, nil
+}
+
+// closeFD closes fd, or points it to /dev/null if it is a standard stream.
+func closeFD(fd int) error {
+	if fd > 2 {
+		return unix.Close(fd)
+	}
+	null, err := unix.Open("/dev/null", unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(null)
+	return unix.Dup3(null, fd, 0)
+}
+
 // do runs the command in a gVisor sandbox and records its exit status.
 func do(ctx context.Context, c *bwrapConfig, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
-	opts, err := c.prepareSandbox()
+	// Read the files before prepareSandbox creates host directories, so that
+	// a bad descriptor leaves the host as it is.
+	files, closeFiles, err := c.readFiles()
 	if err != nil {
 		return util.Errorf("%v", err)
 	}
+	opts, err := c.prepareSandbox()
+	if err != nil {
+		closeFiles()
+		return util.Errorf("%v", err)
+	}
+	if len(files) > 0 {
+		opts = append(opts, sandbox.WithFiles(files...))
+	}
 	// Configure the sandbox to invoke the current runsc executable.
 	if err := os.Setenv(sandbox.RunscPathEnvVar, specutils.ExePath); err != nil {
+		closeFiles()
 		return util.Errorf("bwrap: %v", err)
 	}
 
 	sb, err := sandbox.New(ctx, opts...)
+	// The sandbox has read the files once it is created.
+	closeFiles()
 	if err != nil {
 		return util.Errorf("bwrap: %v", err)
 	}

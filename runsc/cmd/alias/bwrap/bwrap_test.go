@@ -429,6 +429,11 @@ func TestSubDirPath(t *testing.T) {
 func TestParseFlags(t *testing.T) {
 	// mntSrc is a host directory for --bind and --ro-bind sources.
 	mntSrc := t.TempDir()
+	// mntFile is a host file for --ro-bind sources.
+	mntFile := filepath.Join(mntSrc, "file")
+	if err := os.WriteFile(mntFile, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
 	// rootBind is the mount --ro-bind / / produces.
 	rootBind := sandbox.Mount{Type: sandbox.MountTypeBind, Source: "/", Destination: "/", ReadOnly: true, Recursive: true, Private: true, NoSuid: true, NoDev: true}
 
@@ -891,6 +896,170 @@ func TestParseFlags(t *testing.T) {
 			},
 		},
 		{
+			name: "File",
+			args: []string{"--file", "3", "etc//x/", "--perms", "0640", "--file", "4", "/etc/y", "--perms", "07755", "--file", "5", "/etc/z", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:   os.Environ(),
+				UID:   -1,
+				GID:   -1,
+				Files: []File{{FD: 3, Dest: "/etc/x", Perms: 0666}, {FD: 4, Dest: "/etc/y", Perms: 0640}, {FD: 5, Dest: "/etc/z", Perms: 01755}},
+				Args:  []string{"bash"},
+			},
+		},
+		{
+			// The sandbox creates the file after the mounts, so the mounts
+			// before --file stay as they are.
+			name: "FileUnderMount",
+			args: []string{"--tmpfs", "/mnt", "--file", "3", "/mnt/x", "--tmpfs", "/other", "bash"},
+			wantCfg: &bwrapConfig{
+				Env: os.Environ(),
+				UID: -1,
+				GID: -1,
+				Mounts: []sandbox.Mount{
+					{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"},
+					{Type: sandbox.MountTypeTmpfs, Destination: "/other"},
+				},
+				Files: []File{{FD: 3, Dest: "/mnt/x", Perms: 0666}},
+				Args:  []string{"bash"},
+			},
+		},
+		{
+			name: "FileHiddenByLaterMount",
+			args: []string{"--file", "3", "/mnt/x", "--file", "4", "/mnt/a/x", "--tmpfs", "/mnt", "--file", "5", "/mnt/y", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "/mnt"}},
+				Files: []File{
+					{FD: 3, Dest: "/mnt/x", Perms: 0666, Hidden: true},
+					{FD: 4, Dest: "/mnt/a/x", Perms: 0666, Hidden: true},
+					{FD: 5, Dest: "/mnt/y", Perms: 0666},
+				},
+				Args: []string{"bash"},
+			},
+		},
+		{
+			name: "FileHiddenByLaterRelativeMount",
+			args: []string{"--file", "3", "/mnt/x", "--tmpfs", "mnt", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeTmpfs, Destination: "mnt"}},
+				Files:  []File{{FD: 3, Dest: "/mnt/x", Perms: 0666, Hidden: true}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			name: "FileHiddenByLaterDev",
+			args: []string{"--file", "3", "/dev/x", "--dev", "/dev", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:   os.Environ(),
+				UID:   -1,
+				GID:   -1,
+				Files: []File{{FD: 3, Dest: "/dev/x", Perms: 0666, Hidden: true}},
+				Args:  []string{"bash"},
+			},
+		},
+		{
+			// A bind of a host file over the file replaces it.
+			name: "FileUnderFileBind",
+			args: []string{"--file", "3", "/x", "--ro-bind", mntFile, "/x", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:    os.Environ(),
+				UID:    -1,
+				GID:    -1,
+				Mounts: []sandbox.Mount{{Type: sandbox.MountTypeBind, Source: mntFile, Destination: "/x", ReadOnly: true}},
+				Files:  []File{{FD: 3, Dest: "/x", Perms: 0666, Hidden: true}},
+				Args:   []string{"bash"},
+			},
+		},
+		{
+			name: "RepeatedFile",
+			args: []string{"--file", "3", "/x", "--file", "4", "/x", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:   os.Environ(),
+				UID:   -1,
+				GID:   -1,
+				Files: []File{{FD: 3, Dest: "/x", Perms: 0666}, {FD: 4, Dest: "/x", Perms: 0666}},
+				Args:  []string{"bash"},
+			},
+		},
+		{
+			// The sandbox creates the parents of the file, so --dir above it
+			// does not need a tmpfs stand-in, which would hide the file.
+			name: "DirAboveFile",
+			args: []string{"--file", "3", "/a/b/x", "--dir", "/a", "bash"},
+			wantCfg: &bwrapConfig{
+				Env:   os.Environ(),
+				UID:   -1,
+				GID:   -1,
+				Files: []File{{FD: 3, Dest: "/a/b/x", Perms: 0666}},
+				Args:  []string{"bash"},
+			},
+		},
+		{
+			name:        "FileRoot",
+			args:        []string{"--file", "3", "/..", "bash"},
+			errContains: "Can't create file /: is a directory",
+		},
+		{
+			name:        "FileInvalidFD",
+			args:        []string{"--file", "x", "/x", "bash"},
+			errContains: "Invalid fd: x",
+		},
+		{
+			name:        "FileNegativeFD",
+			args:        []string{"--file", "-1", "/x", "bash"},
+			errContains: "Invalid fd: -1",
+		},
+		{
+			name:        "FileEmptyDest",
+			args:        []string{"--file", "3", "", "bash"},
+			errContains: "destination path is empty",
+		},
+		{
+			name:        "MissingFileArg",
+			args:        []string{"--file", "3"},
+			errContains: "--file takes 2 arguments",
+		},
+		{
+			name:        "FileBelowFile",
+			args:        []string{"--file", "3", "/x", "--file", "4", "/x/y", "bash"},
+			errContains: "Can't create file /x/y: --file /x is not a directory",
+		},
+		{
+			name:        "FileAboveFile",
+			args:        []string{"--file", "3", "/x/y", "--file", "4", "/x", "bash"},
+			errContains: "Can't create file /x: is a directory",
+		},
+		{
+			name:        "TmpfsAtFile",
+			args:        []string{"--file", "3", "/x", "--tmpfs", "/x", "bash"},
+			errContains: "Can't mount on /x: --file /x is not a directory",
+		},
+		{
+			name:        "DirBindAtFile",
+			args:        []string{"--file", "3", "/x", "--ro-bind", mntSrc, "/x", "bash"},
+			errContains: "Can't mount on /x: --file /x is not a directory",
+		},
+		{
+			name:        "TmpfsBelowFile",
+			args:        []string{"--file", "3", "/x", "--tmpfs", "/x/y", "bash"},
+			errContains: "Can't mount on /x/y: --file /x is not a directory",
+		},
+		{
+			name:        "DirAtFile",
+			args:        []string{"--file", "3", "/x", "--dir", "/x", "bash"},
+			errContains: "Can't mkdir /x: --file /x is not a directory",
+		},
+		{
+			name:        "DirBelowFile",
+			args:        []string{"--file", "3", "/x", "--dir", "/x/y", "bash"},
+			errContains: "Can't mkdir /x/y: --file /x is not a directory",
+		},
+		{
 			name:        "MissingDirArg",
 			args:        []string{"--dir"},
 			errContains: "--dir takes 1 argument",
@@ -1167,5 +1336,185 @@ func mkdirMode(t *testing.T, path string, mode os.FileMode) {
 	}
 	if err := os.Chmod(path, mode); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// newDataFD returns the read end of a pipe that holds data. The caller owns
+// the descriptor. It has no FD_CLOEXEC flag, as a descriptor that runsc
+// inherits.
+func newDataFD(t *testing.T, data string) int {
+	t.Helper()
+	var p [2]int
+	if err := unix.Pipe2(p[:], 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unix.Write(p[1], []byte(data)); err != nil {
+		t.Fatal(err)
+	}
+	unix.Close(p[1])
+	return p[0]
+}
+
+// fileID identifies the file that a descriptor refers to.
+type fileID struct {
+	dev, ino uint64
+}
+
+// idOf returns the fileID of fd, or the zero fileID if fd is not open.
+func idOf(fd int) fileID {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fileID{}
+	}
+	return fileID{st.Dev, st.Ino}
+}
+
+func TestReadFiles(t *testing.T) {
+	t.Run("Data", func(t *testing.T) {
+		first, hidden, empty := newDataFD(t, "first\n"), newDataFD(t, "hidden"), newDataFD(t, "")
+		c := &bwrapConfig{Files: []File{
+			{FD: first, Dest: "/a", Perms: 0640},
+			{FD: hidden, Dest: "/b", Perms: 0666, Hidden: true},
+			{FD: empty, Dest: "/c", Perms: 0666},
+		}}
+		fds := []int{first, hidden, empty}
+		ids := make([]fileID, len(fds))
+		for i, fd := range fds {
+			ids[i] = idOf(fd)
+		}
+		files, closeFiles, err := c.readFiles()
+		if err != nil {
+			t.Fatalf("readFiles() failed: %v", err)
+		}
+		defer closeFiles()
+		// A memfd may reuse the number of a closed descriptor.
+		for i, fd := range fds {
+			if idOf(fd) == ids[i] {
+				t.Errorf("descriptor %d still refers to its pipe after readFiles()", fd)
+			}
+		}
+		want := []struct {
+			path string
+			mode uint32
+			data string
+		}{{"/a", 0640, "first\n"}, {"/c", 0666, ""}}
+		if len(files) != len(want) {
+			t.Fatalf("readFiles() returned %d files, want %d", len(files), len(want))
+		}
+		for i, w := range want {
+			f := files[i]
+			info, err := f.Data.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			data := make([]byte, info.Size())
+			if _, err := f.Data.ReadAt(data, 0); err != nil && info.Size() > 0 {
+				t.Fatal(err)
+			}
+			if f.Path != w.path || f.Mode != w.mode || string(data) != w.data || !info.Mode().IsRegular() {
+				t.Errorf("file %d = {%q, %#o, %q, %v}, want {%q, %#o, %q, regular}", i, f.Path, f.Mode, data, info.Mode(), w.path, w.mode, w.data)
+			}
+		}
+	})
+
+	t.Run("CurrentOffset", func(t *testing.T) {
+		fd := newDataFD(t, "skipped,kept")
+		buf := make([]byte, len("skipped,"))
+		if _, err := unix.Read(fd, buf); err != nil {
+			t.Fatal(err)
+		}
+		c := &bwrapConfig{Files: []File{{FD: fd, Dest: "/a"}}}
+		files, closeFiles, err := c.readFiles()
+		if err != nil {
+			t.Fatalf("readFiles() failed: %v", err)
+		}
+		defer closeFiles()
+		data := make([]byte, 16)
+		n, _ := files[0].Data.ReadAt(data, 0)
+		if got := string(data[:n]); got != "kept" {
+			t.Errorf("data = %q, want %q", got, "kept")
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		// newFiles returns the entries, and the descriptors that must still
+		// be open afterwards.
+		newFiles func(t *testing.T) ([]File, []int)
+		wantErr  string
+	}{
+		{
+			// The descriptor is consumed by the first --file.
+			name: "SameFDTwice",
+			newFiles: func(t *testing.T) ([]File, []int) {
+				fd := newDataFD(t, "x")
+				return []File{{FD: fd, Dest: "/a"}, {FD: fd, Dest: "/b"}}, nil
+			},
+			wantErr: "Can't read data for file /b: bad file descriptor",
+		},
+		{
+			// A closed descriptor fails before any is read, so the memfd of
+			// the first file cannot take its number.
+			name: "ClosedFD",
+			newFiles: func(t *testing.T) ([]File, []int) {
+				fd, closed := newDataFD(t, "x"), newDataFD(t, "y")
+				unix.Close(closed)
+				t.Cleanup(func() { unix.Close(fd) })
+				return []File{{FD: fd, Dest: "/a"}, {FD: closed, Dest: "/b"}}, []int{fd}
+			},
+			wantErr: "Can't read data for file /b: bad file descriptor",
+		},
+		{
+			// runsc opens its own descriptors with FD_CLOEXEC, and --file
+			// must not take them.
+			name: "OwnFD",
+			newFiles: func(t *testing.T) ([]File, []int) {
+				fd := newDataFD(t, "x")
+				if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, unix.FD_CLOEXEC); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { unix.Close(fd) })
+				return []File{{FD: fd, Dest: "/a"}}, []int{fd}
+			},
+			wantErr: "Can't read data for file /a: bad file descriptor",
+		},
+		{
+			name: "WriteOnlyFD",
+			newFiles: func(t *testing.T) ([]File, []int) {
+				fd, err := unix.Open(filepath.Join(t.TempDir(), "w"), unix.O_WRONLY|unix.O_CREAT, 0600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { unix.Close(fd) })
+				return []File{{FD: fd, Dest: "/a"}}, []int{fd}
+			},
+			wantErr: "Can't read data for file /a: bad file descriptor",
+		},
+		{
+			name: "DirectoryFD",
+			newFiles: func(t *testing.T) ([]File, []int) {
+				fd, err := unix.Open(t.TempDir(), unix.O_RDONLY|unix.O_DIRECTORY, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { unix.Close(fd) })
+				return []File{{FD: fd, Dest: "/a"}}, []int{fd}
+			},
+			wantErr: "Can't read data for file /a: is a directory",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, open := tc.newFiles(t)
+			c := &bwrapConfig{Files: entries}
+			files, _, err := c.readFiles()
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("readFiles() = %v, %v, want error containing %q", files, err, tc.wantErr)
+			}
+			for _, fd := range open {
+				if idOf(fd) == (fileID{}) {
+					t.Errorf("descriptor %d is closed after a failed readFiles()", fd)
+				}
+			}
+		})
 	}
 }

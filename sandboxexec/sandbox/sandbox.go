@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +77,7 @@ type Options struct {
 	rootReadonly bool
 	user         *specs.User
 	capabilities *specs.LinuxCapabilities
+	files        []File
 
 	// Namespaces and ID mappings.
 	namespaces            []specs.LinuxNamespace
@@ -181,6 +183,66 @@ func WithMount(mounts ...Mount) Option {
 func WithHostname(hostname string) Option {
 	return func(o *Options) {
 		o.hostname = hostname
+	}
+}
+
+// File is a regular file in the sandbox filesystem.
+type File struct {
+	// Path is where the file is in the sandbox. A relative Path is resolved
+	// from the root directory "/". Path must not have a ".." component.
+	Path string
+
+	// Mode is the permission bits of a new file, up to 07777. The umask does
+	// not apply. An existing file keeps its mode.
+	Mode uint32
+
+	// Data holds the content of the file. It must be a regular file open for
+	// reading. The sandbox reads all of it, from offset 0, while it starts.
+	// The caller keeps ownership of Data and can close it once New returns.
+	Data *os.File
+}
+
+// WithFiles adds regular files to the sandbox filesystem. The sandbox creates
+// them in the order provided, after all of its mounts and before its working
+// directory, with the user of its init process and the capabilities that it
+// keeps after execve(2). The sandbox's seccomp filter does not apply to them.
+// Missing parent directories are created with mode 0755, without the group
+// bits if Mode grants no group access, and without the other bits if Mode
+// grants no other access. An existing regular file at Path is
+// truncated, and keeps its mode and owner. A symlink, a directory or any other
+// file at Path makes the sandbox fail to start. WithFiles cannot be used to
+// restore a checkpoint.
+func WithFiles(files ...File) Option {
+	return func(o *Options) {
+		for _, f := range files {
+			if f.Path == "" || f.Data == nil {
+				o.err = fmt.Errorf("file path and data cannot be empty: %+v", f)
+				return
+			}
+			if slices.Contains(strings.Split(f.Path, "/"), "..") {
+				o.err = fmt.Errorf("file path cannot have a \"..\" component: %q", f.Path)
+				return
+			}
+			f.Path = filepath.Join("/", f.Path)
+			if f.Path == "/" {
+				o.err = fmt.Errorf("file path cannot be the root directory")
+				return
+			}
+			if f.Mode&^07777 != 0 {
+				o.err = fmt.Errorf("file mode %#o of %q has bits outside 07777", f.Mode, f.Path)
+				return
+			}
+			info, err := f.Data.Stat()
+			if err != nil {
+				o.err = fmt.Errorf("file data for %q: %w", f.Path, err)
+				return
+			}
+			if !info.Mode().IsRegular() {
+				o.err = fmt.Errorf("file data for %q is not a regular file", f.Path)
+				return
+			}
+			o.files = append(o.files, f)
+		}
 	}
 }
 
@@ -389,6 +451,7 @@ func (o *Options) toBundleConfig(annotations map[string]string) bundleConfig {
 		RootReadonly: o.rootReadonly,
 		User:         o.user,
 		Capabilities: o.capabilities,
+		Files:        o.files,
 
 		Namespaces:            o.namespaces,
 		SkipDefaultNamespaces: o.skipDefaultNamespaces,
@@ -578,6 +641,12 @@ func New(ctx context.Context, opts ...Option) (*Sandbox, error) {
 			isCheckpointRestore = true
 		}
 	}
+	if isCheckpointRestore && len(options.files) > 0 {
+		return nil, fmt.Errorf("files cannot be added to a sandbox that restores a checkpoint")
+	}
+	for i := range options.files {
+		runFlags = append(runFlags, fmt.Sprintf("--pass-fd=%d:%d", fileFD(i), fileFD(i)))
+	}
 	options.stateDir = stateDir
 	bundleDir, err = newBundle(options.toBundleConfig(annotations))
 	if err != nil {
@@ -609,6 +678,10 @@ func New(ctx context.Context, opts ...Option) (*Sandbox, error) {
 		args = append(args, "--bundle", sb.bundleDir, "--detach", sb.id)
 	}
 	cmd := exec.CommandContext(ctx, sb.runscPath, args...)
+	// The child gets ExtraFiles[i] as descriptor fileFD(i).
+	for _, f := range options.files {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, f.Data)
+	}
 	// Capture runsc standard error output for diagnostic errors on launch failure.
 	var errFile *os.File
 	if f, err := os.CreateTemp("", "runsc-stderr-*"); err == nil {

@@ -17,11 +17,13 @@ package sandbox
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // defaultInitArgs is the placeholder init that keeps the sandbox alive for
@@ -59,6 +61,10 @@ type bundleConfig struct {
 	// Capabilities is the capability set of the init process. When nil, the
 	// runtime applies its own default.
 	Capabilities *specs.LinuxCapabilities
+
+	// Files are regular files to create in the container's filesystem. The
+	// data of Files[i] reaches the init process as descriptor fileFD(i).
+	Files []File
 
 	// Namespaces are appended to the namespace set.
 	Namespaces []specs.LinuxNamespace
@@ -171,9 +177,30 @@ func newSpec(cfg bundleConfig) (*specs.Spec, error) {
 		user = *cfg.User
 	}
 
+	annotations := cfg.Annotations
+	if len(cfg.Files) > 0 {
+		files := make([]specutils.File, 0, len(cfg.Files))
+		for i, f := range cfg.Files {
+			files = append(files, specutils.File{FD: fileFD(i), Path: f.Path, Mode: f.Mode})
+		}
+		val, err := json.Marshal(files)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode files: %w", err)
+		}
+		annotations = maps.Clone(annotations)
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+		annotations[specutils.AnnotationFiles] = string(val)
+		// Report a bad file now rather than when runsc starts.
+		if _, err := specutils.Files(&specs.Spec{Annotations: annotations}); err != nil {
+			return nil, err
+		}
+	}
+
 	spec := &specs.Spec{
 		Version:     "1.0.0",
-		Annotations: cfg.Annotations,
+		Annotations: annotations,
 		Root: &specs.Root{
 			Path:     rootPath,
 			Readonly: cfg.RootReadonly,
@@ -247,6 +274,13 @@ func newSpec(cfg bundleConfig) (*specs.Spec, error) {
 	}
 
 	return spec, nil
+}
+
+// fileFD returns the descriptor number that the data of the i-th file has in
+// runsc and in the container's init process. Descriptors 0 to 2 are the
+// standard streams.
+func fileFD(i int) int {
+	return 3 + i
 }
 
 // newBundle creates an OCI bundle on the fly with the given configuration and

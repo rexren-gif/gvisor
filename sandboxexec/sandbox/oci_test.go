@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/sandboxexec/sandbox"
 )
 
@@ -209,5 +210,57 @@ func TestSpecMountMode(t *testing.T) {
 				t.Errorf("mount options = %v, want it to contain %q", opts, tc.wantOpt)
 			}
 		})
+	}
+}
+
+func TestSpecFiles(t *testing.T) {
+	data, err := os.CreateTemp(t.TempDir(), "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	spec, err := sandbox.DebugSpec(sandbox.WithFiles(
+		sandbox.File{Path: "/etc/x", Mode: 0640, Data: data},
+		sandbox.File{Path: "y/", Mode: 0666, Data: data},
+	))
+	if err != nil {
+		t.Fatalf("DebugSpec failed: %v", err)
+	}
+	got, err := specutils.Files(spec)
+	if err != nil {
+		t.Fatalf("specutils.Files failed: %v", err)
+	}
+	want := []specutils.File{
+		{FD: 3, Path: "/etc/x", Mode: 0640},
+		{FD: 4, Path: "/y", Mode: 0666},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("files = %+v, want %+v", got, want)
+	}
+
+	spec, err = sandbox.DebugSpec()
+	if err != nil {
+		t.Fatalf("DebugSpec failed: %v", err)
+	}
+	if _, ok := spec.Annotations[specutils.AnnotationFiles]; ok {
+		t.Errorf("spec without files has annotation %s", specutils.AnnotationFiles)
+	}
+
+	dir, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	for _, f := range []sandbox.File{
+		{Path: "/x"},
+		{Data: data},
+		{Path: "/", Data: data},
+		{Path: "/a/../b", Data: data},
+		{Path: "/x", Mode: 010000, Data: data},
+		{Path: "/x", Data: dir},
+	} {
+		if _, err := sandbox.DebugSpec(sandbox.WithFiles(f)); err == nil {
+			t.Errorf("DebugSpec(WithFiles(%+v)) succeeded, want error", f)
+		}
 	}
 }
